@@ -269,6 +269,7 @@ import {
 } from "@t3tools/shared/usageLimits";
 import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
 import * as AgentSessionImporter from "./project/AgentSessionImporter.ts";
+import * as ImportedTranscriptSync from "./project/ImportedTranscriptSync.ts";
 import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import { requestUrl } from "./requestUrl.ts";
 
@@ -1433,6 +1434,7 @@ export const layerWsRpc = (
       const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
       const agentSessionImporter = yield* AgentSessionImporter.AgentSessionImporter;
+      const importedTranscriptSync = yield* ImportedTranscriptSync.ImportedTranscriptSync;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const nativeChildWork = yield* NativeChildWorkQuery.NativeChildWorkQuery;
       const keybindings = yield* Keybindings.Keybindings;
@@ -2264,6 +2266,7 @@ export const layerWsRpc = (
         [ORCHESTRATION_V2_WS_METHODS.subscribeThread]: (input) =>
           Stream.unwrap(
             Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+              Effect.andThen(importedTranscriptSync.watch(input.threadId)),
               Effect.andThen(subscribeOrchestrationV2Thread(input)),
             ),
           ),
