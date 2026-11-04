@@ -97,5 +97,11 @@ with up to 100,000 input records. Run import again to continue a large batch.
 Completed conversations are not imported again. You can continue without the
 remaining history.
 
+An imported Claude conversation stays in sync when you also continue it with
+`claude --resume` somewhere else, one client at a time. While the thread is open,
+T3 Code adds the user and assistant messages the other client wrote a few seconds
+after its turn ends; running import again does the same for every imported
+Claude thread. Messages from turns T3 Code ran itself are not added twice.
+
 You can continue without configuring agents or importing projects, or return to an earlier step
 using the setup progress bar. Navigation pauses while an import is running.
