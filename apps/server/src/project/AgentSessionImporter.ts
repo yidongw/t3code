@@ -10,7 +10,6 @@ import {
   AgentSessionScanError,
   AgentSessionSource,
   EventId,
-  MessageId,
   ProjectId,
   ProviderDriverKind,
   ThreadId,
@@ -18,10 +17,8 @@ import {
   type AgentSessionImportInput,
   type AgentSessionImportResult,
   type OrchestrationV2AppThread,
-  type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
-  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -39,9 +36,10 @@ import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import * as ImportedTranscriptSync from "./ImportedTranscriptSync.ts";
 import * as ProjectService from "./ProjectService.ts";
 
-const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
+const IMPORT_EVENT_PREFIX = ImportedTranscriptSync.IMPORT_EVENT_PREFIX;
 const CLAUDE_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
@@ -94,78 +92,15 @@ function messageEvents(input: {
   readonly index: number;
   readonly message: AgentSessionScanner.AgentSessionThreadMessage;
 }): ReadonlyArray<OrchestrationV2DomainEvent> {
-  const ordinal = input.index + 1;
   const suffix = String(input.index).padStart(6, "0");
-  const messageId = MessageId.make(`${input.threadId}:${suffix}`);
-  const turnItemId = TurnItemId.make(
-    `${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`,
-  );
-  const at = dateTime(input.message.createdAt);
-  const message: OrchestrationV2ConversationMessage = {
-    createdBy: input.message.role === "user" ? "user" : "agent",
-    creationSource: "server",
-    id: messageId,
+  return ImportedTranscriptSync.importedMessageEvents({
     threadId: input.threadId,
-    runId: null,
-    nodeId: null,
-    role: input.message.role,
-    text: input.message.text,
-    attachments: [],
-    streaming: false,
-    createdAt: at,
-    updatedAt: at,
-  };
-  const common = {
-    id: turnItemId,
-    threadId: input.threadId,
-    runId: null,
-    nodeId: null,
-    providerThreadId: null,
-    providerTurnId: null,
-    nativeItemRef: null,
-    parentItemId: null,
-    ordinal,
-    status: "completed" as const,
-    title: null,
-    startedAt: at,
-    completedAt: at,
-    updatedAt: at,
-  };
-  const turnItem: OrchestrationV2TurnItem =
-    input.message.role === "user"
-      ? {
-          ...common,
-          createdBy: "user",
-          creationSource: "server",
-          type: "user_message",
-          messageId,
-          inputIntent: "turn_start",
-          text: input.message.text,
-          attachments: [],
-        }
-      : {
-          ...common,
-          type: "assistant_message",
-          messageId,
-          text: input.message.text,
-          streaming: false,
-        };
-  return [
-    {
-      id: EventId.make(`${IMPORT_EVENT_PREFIX}:message:${input.threadId}:${suffix}`),
-      type: "message.updated",
-      threadId: input.threadId,
-      occurredAt: at,
-      payload: message,
-    },
-    {
-      id: EventId.make(`${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`),
-      type: "turn-item.updated",
-      threadId: input.threadId,
-      occurredAt: at,
-      payload: turnItem,
-    },
-  ];
+    prefix: IMPORT_EVENT_PREFIX,
+    messageKey: suffix,
+    itemKey: suffix,
+    ordinal: input.index + 1,
+    message: input.message,
+  });
 }
 
 const make = Effect.gen(function* () {
@@ -176,6 +111,7 @@ const make = Effect.gen(function* () {
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const settingsService = yield* ServerSettings.ServerSettingsService;
+  const transcriptSync = yield* ImportedTranscriptSync.ImportedTranscriptSync;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
@@ -303,7 +239,15 @@ const make = Effect.gen(function* () {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
             yield* persistRuntime;
-            yield* runtimes.recordImportedTranscript({ threadId, source });
+            if (thread.source !== "claudeAgent") {
+              yield* runtimes.recordImportedTranscript({ threadId, source });
+              return true;
+            }
+            // The transcript changed since it was recorded: append what other clients wrote.
+            const synced = yield* transcriptSync.syncThread(threadId, { source });
+            if (synced._tag === "Unchanged" || synced._tag === "NotSyncable") {
+              yield* runtimes.recordImportedTranscript({ threadId, source });
+            }
             return true;
           }
 

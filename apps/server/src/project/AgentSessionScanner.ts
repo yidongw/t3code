@@ -285,8 +285,35 @@ function codexTurnId(metadata: unknown): string | null {
   return decoded.value.turn_id;
 }
 
-function isHiddenClaudeRecord(record: DecodedTranscriptRecord): boolean {
+function isHiddenClaudeRecord(
+  record: Pick<DecodedTranscriptRecord, "isSidechain" | "isMeta" | "isCompactSummary">,
+): boolean {
   return record.isSidechain === true || record.isMeta === true || record.isCompactSummary === true;
+}
+
+/** The conversation message a Claude transcript record shows in an imported thread, if any. */
+export function claudeTranscriptMessage(
+  record: Pick<
+    DecodedTranscriptRecord,
+    "type" | "isSidechain" | "isMeta" | "isCompactSummary" | "timestamp"
+  > & {
+    readonly message?:
+      | {
+          readonly content?: string | ReadonlyArray<typeof TranscriptContentBlock.Type> | undefined;
+        }
+      | undefined;
+  },
+  fallbackTimestamp: string,
+): AgentSessionThreadMessage | null {
+  if (isHiddenClaudeRecord(record)) return null;
+  if (record.type !== "user" && record.type !== "assistant") return null;
+  const text = extractText(record.message?.content);
+  if (text.length === 0) return null;
+  return {
+    role: record.type,
+    text,
+    createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
+  };
 }
 
 // Claude repeats session fields on records that need not be retained.
@@ -514,16 +541,8 @@ function parseAgentSessionRecords(
       continue;
     }
     if (input.source === "claudeAgent") {
-      if (isHiddenClaudeRecord(record)) continue;
-      if (record.type !== "user" && record.type !== "assistant") continue;
-      const text = extractText(record.message?.content);
-      if (text.length === 0) continue;
-      retainMessage({
-        role: record.type,
-        text,
-        createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
-        codexResponseUser: false,
-      });
+      const message = claudeTranscriptMessage(record, fallbackTimestamp);
+      if (message !== null) retainMessage({ ...message, codexResponseUser: false });
       continue;
     }
 
@@ -693,7 +712,7 @@ function extractCwd(line: string, source: AgentSessionSource): string | null | f
   return null;
 }
 
-function transcriptIdentity(filePath: string, stats: FileSystem.File.Info) {
+export function transcriptIdentity(filePath: string, stats: FileSystem.File.Info) {
   return {
     filePath,
     size: Number(stats.size),
@@ -714,7 +733,10 @@ type TranscriptIdentity = Pick<
 
 const fileIdKey = (inode: TranscriptIdentity["inode"]) => (inode === null ? null : String(inode));
 
-function sameTranscriptIdentity(left: TranscriptIdentity, right: TranscriptIdentity): boolean {
+export function sameTranscriptIdentity(
+  left: TranscriptIdentity,
+  right: TranscriptIdentity,
+): boolean {
   // Unsafe legacy numbers may already have lost file ID precision.
   if (
     (typeof left.inode === "number" && !Number.isSafeInteger(left.inode)) ||
