@@ -239,6 +239,7 @@ const layerImportedTranscriptSyncProvided = ImportedTranscriptSync.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       ProjectionStore.layer,
+      ProjectStore.layer,
       layerEventSink,
       ProviderSessionRuntime.layer,
       layerProviderSessionManagerProvided,

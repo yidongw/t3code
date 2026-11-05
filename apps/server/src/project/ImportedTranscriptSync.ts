@@ -2,8 +2,10 @@ import {
   AgentSessionImportSource,
   EventId,
   MessageId,
+  ProviderDriverKind,
   ThreadId,
   TurnItemId,
+  type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
@@ -17,24 +19,31 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
+import * as HostProcess from "@t3tools/shared/HostProcess";
+
 import * as EventSink from "../orchestration-v2/EventSink.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import { forkParked } from "../serverActivation.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 
 export const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
 const SYNC_EVENT_PREFIX = "agent-session-sync:v1";
 const TRANSCRIPT_POLL_INTERVAL = Duration.seconds(3);
 const MAX_WATCHED_THREADS = 32;
+// A transcript missing from its expected paths is searched for at most once a minute.
+const TRANSCRIPT_SEARCH_EVERY_POLLS = 20;
 const MAX_SYNC_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 // Claude stamps a prompt after T3 marks the turn started and can flush records just after it settles.
 const T3_TURN_LEAD_MS = 2_000;
@@ -255,6 +264,8 @@ export interface ImportedTranscriptSyncShape {
   ) => Effect.Effect<ImportedTranscriptSyncResult>;
   /** Polls the thread's transcript while the scope is open. */
   readonly watch: (threadId: ThreadId) => Effect.Effect<void, never, Scope.Scope>;
+  /** One poll of every watched thread; a background loop runs it every few seconds. */
+  readonly pollWatched: Effect.Effect<void>;
 }
 
 export class ImportedTranscriptSync extends Context.Service<
@@ -265,6 +276,11 @@ export class ImportedTranscriptSync extends Context.Service<
 const syncTurnItemId = (threadId: ThreadId, uuid: string) =>
   TurnItemId.make(`${SYNC_EVENT_PREFIX}:turn-item:${threadId}:${uuid}`);
 
+/** Claude Code names a session's project directory after the cwd it runs in. */
+const claudeProjectDirName = (cwd: string) => cwd.replace(/[^a-zA-Z0-9]/g, "-");
+
+type TranscriptIdentity = ReturnType<typeof AgentSessionScanner.transcriptIdentity>;
+
 const isImportedClaudeThreadId = (threadId: ThreadId) => threadId.startsWith("import:");
 
 const toMs = (value: DateTime.Utc | null) =>
@@ -272,6 +288,11 @@ const toMs = (value: DateTime.Utc | null) =>
 
 const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const homeDir = yield* HostProcess.HomeDirectory;
+  const hostEnvironment = yield* HostProcess.Environment;
+  const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const projects = yield* ProjectStore.ProjectStoreV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const eventSink = yield* EventSink.EventSinkV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
@@ -306,10 +327,113 @@ const make = Effect.gen(function* () {
     const runtime = yield* runtimes.getByThreadId({ threadId }).pipe(Effect.option);
     if (Option.isNone(runtime) || Option.isNone(runtime.value)) return undefined;
     const payload = decodeImportedTranscripts(runtime.value.value.runtimePayload);
-    return Option.getOrUndefined(payload)?.importedTranscripts?.find(
+    // A transcript that moved keeps its old entry; the latest recorded one comes last.
+    return Option.getOrUndefined(payload)?.importedTranscripts?.findLast(
       (source) =>
         source.provider === "claudeAgent" && source.providerSessionId === providerSessionId,
     );
+  });
+
+  const identityAt = (filePath: string) =>
+    fileSystem.stat(filePath).pipe(
+      Effect.map((stats) =>
+        stats.type === "File" ? AgentSessionScanner.transcriptIdentity(filePath, stats) : null,
+      ),
+      Effect.orElseSucceed(() => null),
+    );
+
+  const claudeProjectsDirs = Effect.fn("ImportedTranscriptSync.claudeProjectsDirs")(function* (
+    recorded: AgentSessionImportSource,
+  ) {
+    const settings = yield* serverSettings.getSettings.pipe(Effect.option);
+    const instance = Option.isNone(settings)
+      ? undefined
+      : (settings.value.providerInstances[recorded.providerInstanceId] ??
+        (recorded.providerInstanceId === "claudeAgent"
+          ? { driver: ProviderDriverKind.make("claudeAgent") }
+          : undefined));
+    const home =
+      instance?.driver === "claudeAgent"
+        ? AgentSessionScanner.claudeInstanceHome({ instance, hostEnvironment, homeDir, path })
+        : null;
+    // The import found the transcript under the home configured at that time.
+    const recordedDir = path.dirname(path.dirname(recorded.filePath));
+    return Array.from(
+      new Set([
+        ...(home === null ? [] : [path.join(home, "projects")]),
+        ...(path.basename(recordedDir) === "projects" ? [recordedDir] : []),
+      ]),
+    );
+  });
+
+  /** Where Claude runs this thread's turns, as RuntimePolicy resolves it. */
+  const threadCwd = Effect.fn("ImportedTranscriptSync.threadCwd")(function* (
+    thread: OrchestrationV2AppThread,
+  ) {
+    if (thread.worktreePath !== null) return thread.worktreePath;
+    const project = yield* projects.get(thread.projectId).pipe(Effect.orElseSucceed(Option.none));
+    return Option.isSome(project) ? project.value.workspaceRoot : null;
+  });
+
+  const missingWarned = new Set<ThreadId>();
+
+  /**
+   * The transcript Claude appends to now: the one under the thread's cwd, else the recorded
+   * one, else (when `search` allows) the newest copy of the session in any Claude project dir.
+   */
+  const locateTranscript = Effect.fn("ImportedTranscriptSync.locateTranscript")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly thread: OrchestrationV2AppThread;
+    readonly recorded: AgentSessionImportSource;
+    readonly hint?: string | undefined;
+    readonly search: boolean;
+  }) {
+    const fileName = `${input.recorded.providerSessionId}.jsonl`;
+    const projectsDirs = yield* claudeProjectsDirs(input.recorded);
+    const cwd = yield* threadCwd(input.thread);
+    const tried = Array.from(
+      new Set([
+        ...(cwd === null
+          ? []
+          : projectsDirs.map((dir) => path.join(dir, claudeProjectDirName(cwd), fileName))),
+        input.recorded.filePath,
+        ...(input.hint === undefined ? [] : [input.hint]),
+      ]),
+    );
+    let found: TranscriptIdentity | null = null;
+    for (const filePath of tried) {
+      found = yield* identityAt(filePath);
+      if (found !== null) break;
+    }
+    const searched = found === null && input.search;
+    if (searched) {
+      for (const dir of projectsDirs) {
+        tried.push(path.join(dir, "*", fileName));
+        const entries = yield* fileSystem
+          .readDirectory(dir)
+          .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+        for (const entry of entries) {
+          const candidate = yield* identityAt(path.join(dir, entry, fileName));
+          if (
+            candidate !== null &&
+            (found === null || (candidate.mtimeMs ?? 0) > (found.mtimeMs ?? 0))
+          ) {
+            found = candidate;
+          }
+        }
+      }
+    }
+    if (found !== null) {
+      missingWarned.delete(input.threadId);
+    } else if (searched && !missingWarned.has(input.threadId)) {
+      missingWarned.add(input.threadId);
+      yield* Effect.logWarning("Imported Claude transcript not found", {
+        threadId: input.threadId,
+        sessionId: input.recorded.providerSessionId,
+        tried,
+      });
+    }
+    return { identity: found, searched };
   });
 
   const isBusy = (records: {
@@ -365,14 +489,13 @@ const make = Effect.gen(function* () {
     }
     if (isBusy(records)) return { _tag: "Busy" } as const;
 
-    const stats = yield* fileSystem.stat(recorded.filePath).pipe(Effect.option);
-    if (Option.isNone(stats) || stats.value.type !== "File") {
-      return { _tag: "Unchanged", source: recorded } as const;
-    }
-    const source: AgentSessionImportSource = {
-      ...recorded,
-      ...AgentSessionScanner.transcriptIdentity(recorded.filePath, stats.value),
-    };
+    const identity =
+      options?.source === undefined
+        ? (yield* locateTranscript({ threadId, thread: records.thread, recorded, search: true }))
+            .identity
+        : yield* identityAt(recorded.filePath);
+    if (identity === null) return { _tag: "Unchanged", source: recorded } as const;
+    const source: AgentSessionImportSource = { ...recorded, ...identity };
     if (
       options?.source === undefined &&
       AgentSessionScanner.sameTranscriptIdentity(recorded, source)
@@ -484,7 +607,8 @@ const make = Effect.gen(function* () {
     readonly refs: number;
     /** undefined until loaded; null when the thread cannot sync. */
     readonly recorded: AgentSessionImportSource | null | undefined;
-    readonly lastSeen: ReturnType<typeof AgentSessionScanner.transcriptIdentity> | null;
+    readonly lastSeen: TranscriptIdentity | null;
+    readonly pollsSinceSearch: number;
   }
   const watched = yield* Ref.make(new Map<ThreadId, WatchEntry>());
 
@@ -510,9 +634,22 @@ const make = Effect.gen(function* () {
       }));
       return;
     }
-    const stats = yield* fileSystem.stat(entry.recorded.filePath).pipe(Effect.option);
-    if (Option.isNone(stats)) return;
-    const identity = AgentSessionScanner.transcriptIdentity(entry.recorded.filePath, stats.value);
+    // The thread's worktree can change while it is open, and the transcript with it.
+    const thread = yield* projections.getThread(threadId).pipe(Effect.option);
+    if (Option.isNone(thread)) return;
+    const located = yield* locateTranscript({
+      threadId,
+      thread: thread.value,
+      recorded: entry.recorded,
+      hint: entry.lastSeen?.filePath,
+      search: entry.pollsSinceSearch >= TRANSCRIPT_SEARCH_EVERY_POLLS,
+    });
+    yield* setEntry(threadId, (current) => ({
+      ...current,
+      pollsSinceSearch: located.searched ? 0 : current.pollsSinceSearch + 1,
+    }));
+    const identity = located.identity;
+    if (identity === null) return;
     if (AgentSessionScanner.sameTranscriptIdentity(entry.recorded, identity)) return;
     // Wait for one quiet interval so a turn still streaming is read once, after it settles.
     if (
@@ -531,17 +668,15 @@ const make = Effect.gen(function* () {
     }));
   });
 
-  yield* forkParked(
-    Ref.get(watched).pipe(
-      Effect.flatMap((current) =>
-        Effect.forEach(current, ([threadId, entry]) => pollThread(threadId, entry), {
-          discard: true,
-        }),
-      ),
-      Effect.catchCause((cause) => Effect.logWarning("Imported transcript poll failed", { cause })),
-      Effect.repeat(Schedule.spaced(TRANSCRIPT_POLL_INTERVAL)),
+  const pollWatched = Ref.get(watched).pipe(
+    Effect.flatMap((current) =>
+      Effect.forEach(current, ([threadId, entry]) => pollThread(threadId, entry), {
+        discard: true,
+      }),
     ),
+    Effect.catchCause((cause) => Effect.logWarning("Imported transcript poll failed", { cause })),
   );
+  yield* forkParked(pollWatched.pipe(Effect.repeat(Schedule.spaced(TRANSCRIPT_POLL_INTERVAL))));
 
   const watch: ImportedTranscriptSyncShape["watch"] = (threadId) =>
     isImportedClaudeThreadId(threadId)
@@ -557,6 +692,8 @@ const make = Effect.gen(function* () {
                 refs: (entry?.refs ?? 0) + 1,
                 recorded: entry?.recorded,
                 lastSeen: entry?.lastSeen ?? null,
+                // The first sync already searched.
+                pollsSinceSearch: entry?.pollsSinceSearch ?? 0,
               }),
             ] as const;
           }),
@@ -574,7 +711,7 @@ const make = Effect.gen(function* () {
         ).pipe(Effect.asVoid)
       : Effect.void;
 
-  return ImportedTranscriptSync.of({ syncThread, watch });
+  return ImportedTranscriptSync.of({ syncThread, watch, pollWatched });
 });
 
 export const layer = Layer.effect(ImportedTranscriptSync, make);

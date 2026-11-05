@@ -23,16 +23,19 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
+import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import { CLAUDE_MODEL_SELECTION } from "../orchestration-v2/testkit/fixtures/shared.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ImportedTranscriptSync from "./ImportedTranscriptSync.ts";
 
@@ -195,8 +198,18 @@ const setup = Effect.fn(function* () {
   const sink = yield* EventSink.EventSinkV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-transcript-sync-" });
-  const filePath = path.join(directory, `${sessionId}.jsonl`);
-  yield* fileSystem.writeFileString(filePath, imported);
+  const claudeHome = path.join(directory, "claude");
+  const workspaceRoot = path.join(directory, "repo");
+  // Claude Code keeps a session under a directory named after the cwd it ran in.
+  const transcriptIn = (projectDir: string) =>
+    path.join(claudeHome, "projects", projectDir, `${sessionId}.jsonl`);
+  const transcriptFor = (cwd: string) => transcriptIn(cwd.replace(/[^a-zA-Z0-9]/g, "-"));
+  const writeTranscript = (target: string, contents: string) =>
+    fileSystem
+      .makeDirectory(path.dirname(target), { recursive: true })
+      .pipe(Effect.andThen(fileSystem.writeFileString(target, contents)));
+  const filePath = transcriptFor(workspaceRoot);
+  yield* writeTranscript(filePath, imported);
   const releases: Array<ProviderSessionId> = [];
 
   const created = utc("10:00:00");
@@ -313,6 +326,34 @@ const setup = Effect.fn(function* () {
           ),
           Layer.succeed(ProviderSessionRuntime.ProviderSessionRuntimeRepository, runtimes),
           Layer.succeed(FileSystem.FileSystem, fileSystem),
+          Layer.succeed(Path.Path, path),
+          ServerSettings.layerTest({
+            providerInstances: {
+              [instanceId]: {
+                driver: ProviderDriverKind.make("claudeAgent"),
+                config: { homePath: claudeHome },
+              },
+            },
+          }),
+          Layer.mock(ProjectStore.ProjectStoreV2)({
+            get: (projectId) =>
+              Effect.succeedSome({
+                projectId,
+                title: "Repo",
+                workspaceRoot,
+                defaultModelSelection: null,
+                defaultThreadEnvMode: null,
+                autoPull: false,
+                faviconPath: null,
+                projectIcon: null,
+                scripts: [],
+                pinnedAt: null,
+                archivedAt: null,
+                createdAt: at("10:00:00"),
+                updatedAt: at("10:00:00"),
+                deletedAt: null,
+              }),
+          }),
           Layer.succeed(
             TurnItemPositionStore.TurnItemPositionStoreV2,
             yield* TurnItemPositionStore.TurnItemPositionStoreV2,
@@ -345,7 +386,35 @@ const setup = Effect.fn(function* () {
         : [],
     );
   });
-  return { sync, sink, append, conversation, releases, fileSystem, filePath };
+  const moveToWorktree = (worktreePath: string) =>
+    sink.write({
+      events: [
+        {
+          id: EventId.make(`thread:worktree:${worktreePath}`),
+          type: "thread.metadata-updated",
+          threadId,
+          occurredAt: utc("10:50:00"),
+          payload: { ...thread, branch: "feature", worktreePath, updatedAt: utc("10:50:00") },
+        },
+      ],
+    });
+  const recordedPath = sync
+    .syncThread(threadId)
+    .pipe(Effect.map((result) => ("source" in result ? result.source.filePath : null)));
+  return {
+    sync,
+    sink,
+    append,
+    conversation,
+    releases,
+    fileSystem,
+    filePath,
+    transcriptIn,
+    transcriptFor,
+    writeTranscript,
+    moveToWorktree,
+    recordedPath,
+  };
 });
 
 it.effect(
@@ -446,3 +515,80 @@ it.effect("treats a truncated or rewritten transcript as a safe no-op", () =>
     expect(yield* conversation).toEqual(before);
   }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
+
+it.effect("follows the transcript to the thread's worktree once the recorded copy is gone", () =>
+  Effect.gen(function* () {
+    const { sync, conversation, fileSystem, filePath, transcriptFor, writeTranscript, ...thread } =
+      yield* setup();
+    const worktreeTranscript = transcriptFor("/work/repo-feature");
+    yield* thread.moveToWorktree("/work/repo-feature");
+    yield* writeTranscript(worktreeTranscript, imported + discordTurn);
+    yield* fileSystem.remove(filePath);
+
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 2 });
+    expect(yield* conversation).toEqual([
+      "1:hi",
+      "2:hello",
+      "3:discord question",
+      "4:discord answer",
+    ]);
+    expect(yield* thread.recordedPath).toBe(worktreeTranscript);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("a watched thread picks up its transcript after its worktree changes", () =>
+  Effect.gen(function* () {
+    const { sync, conversation, transcriptFor, writeTranscript, moveToWorktree, recordedPath } =
+      yield* setup();
+    yield* sync.watch(threadId);
+    yield* sync.pollWatched;
+
+    // Claude starts a new transcript under the worktree; the old one stays behind.
+    const worktreeTranscript = transcriptFor("/work/repo-feature");
+    yield* moveToWorktree("/work/repo-feature");
+    yield* writeTranscript(worktreeTranscript, imported + discordTurn);
+    yield* sync.pollWatched;
+    expect(yield* conversation).toHaveLength(2);
+    // Synced once the file stayed unchanged for one interval.
+    yield* sync.pollWatched;
+    expect(yield* conversation).toEqual([
+      "1:hi",
+      "2:hello",
+      "3:discord question",
+      "4:discord answer",
+    ]);
+    expect(yield* recordedPath).toBe(worktreeTranscript);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("warns once while no transcript exists and recovers when one appears", () => {
+  const warnings: Array<string> = [];
+  const logger = Logger.make(({ message }) => {
+    const text = JSON.stringify(message);
+    if (text.includes("Imported Claude transcript not found")) warnings.push(text);
+  });
+  return Effect.gen(function* () {
+    const { sync, conversation, fileSystem, filePath, transcriptIn, writeTranscript, ...thread } =
+      yield* setup();
+    yield* fileSystem.remove(filePath);
+    yield* sync.watch(threadId);
+    yield* sync.pollWatched;
+    yield* sync.pollWatched;
+    yield* sync.pollWatched;
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(filePath);
+
+    // Only a search of every project directory finds a copy under an unexpected name.
+    const elsewhere = transcriptIn("-private-repo");
+    yield* writeTranscript(elsewhere, imported + discordTurn);
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 2 });
+    expect(yield* thread.recordedPath).toBe(elsewhere);
+    expect(yield* conversation).toHaveLength(4);
+    expect(warnings).toHaveLength(1);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(persistence, Logger.layer([logger], { mergeWithExisting: false })),
+    ),
+  );
+});
