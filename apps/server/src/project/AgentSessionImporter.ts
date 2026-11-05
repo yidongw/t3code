@@ -13,7 +13,6 @@ import {
   ProjectId,
   ProviderDriverKind,
   ThreadId,
-  TurnItemId,
   type AgentSessionImportInput,
   type AgentSessionImportResult,
   type OrchestrationV2AppThread,
@@ -248,6 +247,7 @@ const make = Effect.gen(function* () {
             if (synced._tag === "Unchanged" || synced._tag === "NotSyncable") {
               yield* runtimes.recordImportedTranscript({ threadId, source });
             }
+            yield* transcriptSync.requestBackfill(threadId);
             return true;
           }
 
@@ -337,7 +337,7 @@ const make = Effect.gen(function* () {
                       threadId,
                       occurredAt: createdAt,
                       payload: {
-                        id: TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`),
+                        id: ImportedTranscriptSync.historyNoticeItemId(threadId),
                         threadId,
                         runId: null,
                         nodeId: null,
@@ -374,6 +374,8 @@ const make = Effect.gen(function* () {
           if (committed.length === 0) return null;
           yield* persistRuntime;
           yield* runtimes.recordImportedTranscript({ threadId, source });
+          // The import keeps a window of the history; the backfill adds the rest.
+          if (thread.source === "claudeAgent") yield* transcriptSync.requestBackfill(threadId);
           return true;
         }).pipe(
           Effect.catch((cause) =>

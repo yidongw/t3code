@@ -183,6 +183,7 @@ const makeImporter = Effect.fn(function* (
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const published: Array<ApplicationStoredEvent> = [];
   const syncCalls: Array<{ readonly threadId: ThreadId; readonly filePath?: string }> = [];
+  const backfillRequests: Array<ThreadId> = [];
   const withTransaction: typeof sql.withTransaction = (effect) =>
     beforeTransaction.pipe(Effect.andThen(sql.withTransaction(effect)));
   const importSql = new Proxy(sql, {
@@ -220,6 +221,10 @@ const makeImporter = Effect.fn(function* (
             yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository,
           ),
           Layer.mock(ImportedTranscriptSync.ImportedTranscriptSync)({
+            requestBackfill: (threadId) =>
+              Effect.sync(() => {
+                backfillRequests.push(threadId);
+              }),
             syncThread: (threadId, options) =>
               Effect.sync(() => {
                 syncCalls.push({
@@ -260,7 +265,12 @@ const makeImporter = Effect.fn(function* (
     ),
   );
   const importer = Context.get(context, AgentSessionImporter.AgentSessionImporter);
-  return { run: importer.importRecentAgentThreads({ projectId }), published, syncCalls };
+  return {
+    run: importer.importRecentAgentThreads({ projectId }),
+    published,
+    syncCalls,
+    backfillRequests,
+  };
 });
 
 it.effect(
@@ -462,7 +472,7 @@ it.effect("imports under a policy ceiling in the project's default, kept under t
   }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
 
-it.effect("re-importing a changed Claude transcript syncs the existing thread", () =>
+it.effect("re-importing a changed Claude transcript syncs and backfills the existing thread", () =>
   Effect.gen(function* () {
     const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
     const source = candidate(
@@ -474,11 +484,13 @@ it.effect("re-importing a changed Claude transcript syncs the existing thread", 
     const first = yield* makeImporter([source]);
     expect(yield* first.run).toEqual({ importedCount: 1, skippedCount: 0 });
     expect(first.syncCalls).toEqual([]);
+    expect(first.backfillRequests).toEqual([threadId]);
 
     const changed = { ...source, source: { ...source.source, size: 200, mtimeMs: 5 } };
     const second = yield* makeImporter([changed]);
     expect(yield* second.run).toEqual({ importedCount: 1, skippedCount: 0 });
     expect(second.syncCalls).toEqual([{ threadId, filePath: changed.source.filePath }]);
+    expect(second.backfillRequests).toEqual([threadId]);
     expect(Option.getOrThrow(yield* runtimes.getByThreadId({ threadId }))).toMatchObject({
       runtimePayload: { importedTranscripts: [changed.source] },
     });
