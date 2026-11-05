@@ -197,6 +197,31 @@ function runEvents(input: {
   ];
 }
 
+// Search lists threads of projects it knows.
+const createSearchableProject = Effect.gen(function* () {
+  yield* (yield* ProjectStore.ProjectStoreV2).apply({
+    sequence: 0,
+    eventId: EventId.make("project:created"),
+    aggregateKind: "project",
+    aggregateId: ProjectId.make("project"),
+    occurredAt: at("10:00:00"),
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    type: "project.created",
+    payload: {
+      projectId: ProjectId.make("project"),
+      title: "Repo",
+      workspaceRoot: "/repo",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: at("10:00:00"),
+      updatedAt: at("10:00:00"),
+    },
+  });
+});
+
 interface ImportedHistory {
   /** The transcript as the import found it. */
   readonly transcript: string;
@@ -243,6 +268,8 @@ const setup = Effect.fn(function* (options?: {
   const filePath = transcriptFor(workspaceRoot);
   yield* writeTranscript(filePath, history.transcript);
   const releases: Array<ProviderSessionId> = [];
+  // What the service asked of the file system, to show what a sweep of unchanged threads costs.
+  const fileSystemCalls: Array<string> = [];
 
   const created = utc("10:00:00");
   const providerThread: OrchestrationV2ProviderThread = {
@@ -381,7 +408,17 @@ const setup = Effect.fn(function* (options?: {
             yield* ProjectionStore.ProjectionStoreV2,
           ),
           Layer.succeed(ProviderSessionRuntime.ProviderSessionRuntimeRepository, runtimes),
-          Layer.succeed(FileSystem.FileSystem, fileSystem),
+          Layer.succeed(FileSystem.FileSystem, {
+            ...fileSystem,
+            stat: (target) => {
+              fileSystemCalls.push(`stat ${target}`);
+              return fileSystem.stat(target);
+            },
+            open: (target, openOptions) => {
+              fileSystemCalls.push(`open ${target}`);
+              return fileSystem.open(target, openOptions);
+            },
+          }),
           Layer.succeed(Path.Path, path),
           ServerSettings.layerTest({
             providerInstances: {
@@ -477,8 +514,10 @@ const setup = Effect.fn(function* (options?: {
   return {
     sync,
     build,
+    thread,
     timeline,
     sink,
+    fileSystemCalls,
     append,
     conversation,
     releases,
@@ -771,6 +810,172 @@ it.effect("warns once while no transcript exists and recovers when one appears",
   );
 });
 
+it.effect(
+  "a sweep syncs an imported thread nobody has open, at the cost of one stat while unchanged",
+  () =>
+    Effect.gen(function* () {
+      const { sync, append, conversation, fileSystemCalls, filePath, releases } = yield* setup();
+      expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+      fileSystemCalls.length = 0;
+      expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+      expect(fileSystemCalls).toEqual([`stat ${filePath}`]);
+
+      yield* append(discordTurn);
+      expect(yield* sync.sweepImported).toEqual({ threadsSynced: 1, messagesAppended: 2 });
+      expect(yield* conversation).toEqual([
+        "1:hi",
+        "2:hello",
+        "3:discord question",
+        "4:discord answer",
+      ]);
+      expect(releases).toEqual([providerSessionId]);
+
+      fileSystemCalls.length = 0;
+      expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+      expect(fileSystemCalls).toEqual([`stat ${filePath}`]);
+
+      yield* createSearchableProject;
+      const { matches } = yield* (yield* ThreadSearch.ThreadSearch).search({
+        query: "discord question",
+      });
+      expect(matches).toMatchObject([
+        { threadId, snippet: expect.stringContaining("discord question") },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect(
+  "the first sweep after a restart catches up turns written while the server was down",
+  () =>
+    Effect.gen(function* () {
+      const { build, append, conversation } = yield* setup();
+      yield* append(discordTurn);
+      yield* append(laterDiscordTurn);
+      const restarted = yield* build;
+      expect(yield* restarted.sweepImported).toEqual({ threadsSynced: 1, messagesAppended: 4 });
+      expect(yield* conversation).toEqual([
+        "1:hi",
+        "2:hello",
+        "3:discord question",
+        "4:discord answer",
+        "5:later question",
+        "6:later answer",
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("a sweep leaves a thread alone while T3 runs it and syncs it once the run is over", () =>
+  Effect.gen(function* () {
+    const { sync, sink, append, conversation, fileSystemCalls } = yield* setup();
+    const runningRun = { ordinal: 1, startedAt: "10:04:59", nativeTurnId: "a2" } as const;
+    yield* sink.write({
+      events: runEvents({ ...runningRun, status: "running", completedAt: null }),
+    });
+    yield* append(t3Turn);
+    fileSystemCalls.length = 0;
+    expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+    expect(fileSystemCalls.filter((call) => call.startsWith("open "))).toEqual([]);
+
+    yield* sink.write({
+      events: runEvents({
+        ...runningRun,
+        status: "completed",
+        completedAt: "10:05:11",
+        items: [
+          { role: "user", text: "t3 prompt" },
+          { role: "assistant", text: "t3 answer" },
+        ],
+      }),
+    });
+    yield* append(discordTurn);
+    expect(yield* sync.sweepImported).toEqual({ threadsSynced: 1, messagesAppended: 2 });
+    expect(yield* conversation).toEqual([
+      "1:hi",
+      "2:hello",
+      "1000001:t3 prompt",
+      "1000002:t3 answer",
+      "1000003:discord question",
+      "1000004:discord answer",
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect.each(["thread.archived", "thread.deleted"] as const)(
+  "a sweep skips a thread after %s",
+  (type) =>
+    Effect.gen(function* () {
+      const { sync, sink, thread, append, conversation, fileSystemCalls } = yield* setup();
+      yield* sink.write({
+        events: [
+          {
+            id: EventId.make(type),
+            type,
+            threadId,
+            occurredAt: utc("10:01:00"),
+            payload: {
+              ...thread,
+              ...(type === "thread.archived"
+                ? { archivedAt: utc("10:01:00") }
+                : { deletedAt: utc("10:01:00") }),
+              updatedAt: utc("10:01:00"),
+            },
+          },
+        ],
+      });
+      yield* append(discordTurn);
+      expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+      // Until the thread is resolved again, later sweeps do not even stat its transcript.
+      fileSystemCalls.length = 0;
+      expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+      expect(fileSystemCalls).toEqual([]);
+      expect(yield* conversation).toEqual(["1:hi", "2:hello"]);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("a sweep never touches the transcripts of Codex or non-imported threads", () =>
+  Effect.gen(function* () {
+    const { sync, fileSystem, filePath, fileSystemCalls, writeTranscript, transcriptIn } =
+      yield* setup();
+    const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+    const otherPath = transcriptIn("-other");
+    yield* writeTranscript(otherPath, imported);
+    const recordedOther = AgentSessionScanner.transcriptIdentity(
+      otherPath,
+      yield* fileSystem.stat(otherPath),
+    );
+    yield* writeTranscript(otherPath, imported + discordTurn);
+    const others = [
+      { threadId: ThreadId.make(`import:codex:${sessionId}`), provider: "codex" },
+      { threadId: ThreadId.make("thread:native"), provider: "claudeAgent" },
+    ] as const;
+    for (const other of others) {
+      yield* runtimes.upsert({
+        threadId: other.threadId,
+        providerName: ProviderDriverKind.make(other.provider),
+        providerInstanceId: instanceId,
+        adapterKey: ProviderDriverKind.make(other.provider),
+        runtimeMode: "full-access",
+        status: "stopped",
+        lastSeenAt: at("10:00:01"),
+        resumeCursor: null,
+        runtimePayload: {
+          importedTranscripts: [
+            {
+              ...recordedOther,
+              provider: other.provider,
+              providerInstanceId: instanceId,
+              providerSessionId: sessionId,
+            },
+          ],
+        },
+      });
+    }
+    fileSystemCalls.length = 0;
+    expect(yield* sync.sweepImported).toEqual({ threadsSynced: 0, messagesAppended: 0 });
+    expect(fileSystemCalls).toEqual([`stat ${filePath}`]);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
 function hiddenLine(
   flag: "isMeta" | "isCompactSummary" | "isSidechain",
   uuid: string,
@@ -895,27 +1100,7 @@ it.effect(
       expect((yield* timeline).slice(1)).toEqual([...backfilled, "1000005:after the backfill"]);
 
       // Backfilled messages are indexed like any other.
-      yield* (yield* ProjectStore.ProjectStoreV2).apply({
-        sequence: 0,
-        eventId: EventId.make("project:created"),
-        aggregateKind: "project",
-        aggregateId: ProjectId.make("project"),
-        occurredAt: at("10:00:00"),
-        commandId: null,
-        causationEventId: null,
-        correlationId: null,
-        metadata: {},
-        type: "project.created",
-        payload: {
-          projectId: ProjectId.make("project"),
-          title: "Repo",
-          workspaceRoot: "/repo",
-          defaultModelSelection: null,
-          scripts: [],
-          createdAt: at("10:00:00"),
-          updatedAt: at("10:00:00"),
-        },
-      });
+      yield* createSearchableProject;
       const { matches } = yield* (yield* ThreadSearch.ThreadSearch).search({
         query: "dropped reply",
       });

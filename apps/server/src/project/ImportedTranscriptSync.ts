@@ -51,6 +51,13 @@ const MAX_SYNC_BYTES = 16 * 1024 * 1024;
 const READ_CHUNK_BYTES = 1024 * 1024;
 // Larger records are tool output, not conversation; they are skipped without being held.
 const MAX_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024;
+// Imported threads nobody has open are checked by a sweep: one stat per thread while unchanged.
+const IMPORTED_SWEEP_STARTUP_DELAY = Duration.seconds(10);
+const IMPORTED_SWEEP_INTERVAL = Duration.seconds(30);
+// A swept thread's cwd, archive state and transcript path are re-resolved this often.
+const IMPORTED_SWEEP_RELOCATE_EVERY = 10;
+// A missing transcript is searched for in every project directory about once a minute.
+const IMPORTED_SWEEP_SEARCH_EVERY = 2;
 // Claude stamps a prompt after T3 marks the turn started and can flush records just after it settles.
 const T3_TURN_LEAD_MS = 2_000;
 const T3_TURN_GRACE_MS = 5_000;
@@ -360,6 +367,14 @@ export interface ImportedTranscriptSyncShape {
   readonly backfillStep: (threadId: ThreadId) => Effect.Effect<ImportedHistoryBackfillStep>;
   /** Queues the thread's backfill ahead of the startup sweep. */
   readonly requestBackfill: (threadId: ThreadId) => Effect.Effect<void>;
+  /**
+   * One pass over every imported Claude thread that is not open, syncing those whose transcript
+   * changed. A background loop runs it at startup and every half minute.
+   */
+  readonly sweepImported: Effect.Effect<{
+    readonly threadsSynced: number;
+    readonly messagesAppended: number;
+  }>;
 }
 
 export class ImportedTranscriptSync extends Context.Service<
@@ -1418,12 +1433,131 @@ const make = Effect.fn("ImportedTranscriptSync.make")(function* (
         ).pipe(Effect.andThen(queueBackfill(threadId, "first")))
       : Effect.void;
 
+  interface SweepEntry {
+    /** The transcript last located; null when none was found. */
+    readonly filePath: string | null;
+    /** Archived, deleted or no longer an imported Claude thread when last resolved. */
+    readonly skipped: boolean;
+    readonly sweepsSinceLocate: number;
+    readonly sweepsSinceSearch: number;
+  }
+  // Only the sweep loop touches this.
+  const swept = new Map<ThreadId, SweepEntry>();
+
+  /** Appended message count, or null when the thread did not sync. */
+  const sweepThread = Effect.fn("ImportedTranscriptSync.sweepThread")(function* (
+    threadId: ThreadId,
+    recorded: AgentSessionImportSource,
+  ) {
+    const entry: SweepEntry = swept.get(threadId) ?? {
+      filePath: null,
+      skipped: false,
+      sweepsSinceLocate: IMPORTED_SWEEP_RELOCATE_EVERY,
+      sweepsSinceSearch: IMPORTED_SWEEP_SEARCH_EVERY,
+    };
+    if (entry.sweepsSinceLocate < IMPORTED_SWEEP_RELOCATE_EVERY) {
+      const next = { ...entry, sweepsSinceLocate: entry.sweepsSinceLocate + 1 };
+      if (entry.skipped) {
+        swept.set(threadId, next);
+        return null;
+      }
+      if (entry.filePath !== null) {
+        const identity = yield* identityAt(entry.filePath);
+        if (identity !== null && AgentSessionScanner.sameTranscriptIdentity(recorded, identity)) {
+          swept.set(threadId, next);
+          return null;
+        }
+      }
+    }
+    // Changed, missing or due: resolve the thread before reading anything.
+    const thread = yield* projections.getThread(threadId).pipe(Effect.option);
+    if (
+      Option.isNone(thread) ||
+      thread.value.historyOrigin !== "v1_import" ||
+      thread.value.archivedAt !== null ||
+      thread.value.deletedAt !== null
+    ) {
+      swept.set(threadId, { ...entry, filePath: null, skipped: true, sweepsSinceLocate: 0 });
+      return null;
+    }
+    const located = yield* locateTranscript({
+      threadId,
+      thread: thread.value,
+      recorded,
+      hint: entry.filePath ?? undefined,
+      search: entry.sweepsSinceSearch >= IMPORTED_SWEEP_SEARCH_EVERY,
+    });
+    swept.set(threadId, {
+      filePath: located.identity?.filePath ?? null,
+      skipped: false,
+      sweepsSinceLocate: 0,
+      sweepsSinceSearch: located.searched ? 0 : entry.sweepsSinceSearch + 1,
+    });
+    if (
+      located.identity === null ||
+      AgentSessionScanner.sameTranscriptIdentity(recorded, located.identity)
+    ) {
+      return null;
+    }
+    // Busy threads keep their recorded identity, so a later sweep retries them.
+    const running = yield* runState(threadId);
+    if (running === null || running.busy) return null;
+    const result = yield* syncThread(threadId);
+    if (result._tag === "NotSyncable") {
+      swept.set(threadId, { ...entry, filePath: null, skipped: true, sweepsSinceLocate: 0 });
+    }
+    return result._tag === "Synced" ? result.appendedCount : null;
+  });
+
+  const sweepImported: ImportedTranscriptSyncShape["sweepImported"] = Effect.gen(function* () {
+    const rows = yield* runtimes.list();
+    const open = yield* Ref.get(watched);
+    let threadsSynced = 0;
+    let messagesAppended = 0;
+    const seen = new Set<ThreadId>();
+    for (const row of rows) {
+      if (!isImportedClaudeThreadId(row.threadId)) continue;
+      const recorded = Option.getOrUndefined(
+        decodeImportedTranscripts(row.runtimePayload),
+      )?.importedTranscripts?.findLast((source) => source.provider === "claudeAgent");
+      if (recorded === undefined) continue;
+      seen.add(row.threadId);
+      // Open threads are polled every few seconds instead.
+      if (open.has(row.threadId)) continue;
+      const appended = yield* sweepThread(row.threadId, recorded);
+      if (appended !== null && appended > 0) {
+        threadsSynced += 1;
+        messagesAppended += appended;
+      }
+    }
+    for (const threadId of swept.keys()) {
+      if (!seen.has(threadId)) swept.delete(threadId);
+    }
+    if (threadsSynced > 0) {
+      yield* Effect.logInfo("Synced imported Claude threads", { threadsSynced, messagesAppended });
+    }
+    return { threadsSynced, messagesAppended };
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("Imported transcript sweep failed", { cause }).pipe(
+        Effect.as({ threadsSynced: 0, messagesAppended: 0 }),
+      ),
+    ),
+  );
+  // The first sweep catches up threads whose transcripts changed while the server was down.
+  yield* forkParked(
+    Effect.sleep(IMPORTED_SWEEP_STARTUP_DELAY).pipe(
+      Effect.andThen(sweepImported.pipe(Effect.repeat(Schedule.spaced(IMPORTED_SWEEP_INTERVAL)))),
+    ),
+  );
+
   return ImportedTranscriptSync.of({
     syncThread,
     watch,
     pollWatched,
     backfillStep,
     requestBackfill,
+    sweepImported,
   });
 });
 
