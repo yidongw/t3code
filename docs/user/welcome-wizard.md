@@ -83,7 +83,10 @@ Pi conversation imports its active branch, the one Pi reopens.
 
 Conversation import is best effort. T3 Code keeps the first user prompt and the
 newest remaining visible user and assistant messages, with 200 messages total.
-It omits tool activity and attachments. For Codex, it omits generated setup
+For Claude, T3 Code then copies the rest of the conversation from the session
+transcript in the background, starting with the thread you open, so older
+messages appear in the thread and in search shortly after the import. It omits
+tool activity and attachments. For Codex, it omits generated setup
 context only when a canonical user event and a valid shared turn ID identify the
 same user turn. Ambiguous legacy or response-only context stays in the imported
 conversation so T3 Code does not remove user text. It reads one conversation at
@@ -93,7 +96,8 @@ does not count toward that limit. It ignores malformed records and skips
 unreadable or unparseable conversations.
 
 Each import attempt reads up to 100 conversation files and 4 GiB per project,
-with up to 100,000 input records. Run import again to continue a large batch.
+and up to 100,000 input records in a Codex or Pi conversation. Run import again
+to continue a large batch.
 Completed conversations are not imported again. You can continue without the
 remaining history.
 
