@@ -29,6 +29,7 @@ import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 import * as DateTime from "effect/DateTime";
 
 import {
+  hasRunlessProviderWork,
   threadRuntimeIsActive,
   type ThreadRunSummary,
   type ThreadRuntimeSummary,
@@ -260,11 +261,7 @@ export function deriveThreadStructureRuntime(
     }),
   );
   // A pull request watch can hold a thread that never ran.
-  if (
-    latestRun === null &&
-    projection.thread.activeProviderThreadId === null &&
-    !backgroundWorkHoldsRun
-  ) {
+  if (latestRun === null && !hasRunlessProviderWork(projection.thread) && !backgroundWorkHoldsRun) {
     return null;
   }
   const activeRunId =

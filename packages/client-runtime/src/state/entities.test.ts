@@ -7,6 +7,7 @@ import {
   ProviderThreadId,
   RunId,
   RuntimeRequestId,
+  ThreadId,
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -86,6 +87,75 @@ describe("V2 client presentation", () => {
         pendingBackgroundTasks: [],
       }).runtime,
     ).toBeNull();
+  });
+
+  it("presents a thread that holds a provider thread but never ran as ready, unless a provider subagent", () => {
+    const providerThreadId = ProviderThreadId.make("provider-thread-imported");
+    const imported = {
+      ...v2ThreadShell,
+      historyOrigin: "v1_import" as const,
+      activeProviderThreadId: providerThreadId,
+      settledOverride: "active" as const,
+    };
+    const importedShell = presentThreadShell(environmentId, imported);
+    expect(importedShell.runtime).toBeNull();
+    expect(isThreadWorking(importedShell)).toBe(false);
+    const importedDetail = {
+      ...v2Projection,
+      thread: { ...v2Projection.thread, activeProviderThreadId: providerThreadId },
+    };
+    expect(deriveThreadRuntime(importedDetail)).toBeNull();
+
+    const runId = RunId.make("run-after-import");
+    const ranShell = presentThreadShell(environmentId, {
+      ...imported,
+      latestRunId: runId,
+      status: "completed",
+    });
+    expect(ranShell.runtime).toMatchObject({ status: "completed", activeRunId: null });
+    expect(isThreadWorking(ranShell)).toBe(false);
+    const ranDetail = {
+      ...importedDetail,
+      runs: [
+        {
+          id: runId,
+          threadId: v2Projection.thread.id,
+          ordinal: 1,
+          providerInstanceId: v2Projection.thread.providerInstanceId,
+          modelSelection: v2Projection.thread.modelSelection,
+          providerThreadId,
+          userMessageId: MessageId.make("message-after-import"),
+          rootNodeId: null,
+          activeAttemptId: null,
+          status: "completed" as const,
+          requestedAt: v2Projection.updatedAt,
+          startedAt: v2Projection.updatedAt,
+          completedAt: v2Projection.updatedAt,
+          checkpointId: null,
+          contextHandoffId: null,
+        },
+      ],
+    };
+    expect(deriveThreadRuntime(ranDetail)).toMatchObject({ status: "completed" });
+
+    const subagent = {
+      lineage: {
+        rootThreadId: ThreadId.make("thread-parent"),
+        parentThreadId: ThreadId.make("thread-parent"),
+        relationshipToParent: "subagent" as const,
+      },
+      creationSource: "provider" as const,
+    };
+    expect(
+      presentThreadShell(environmentId, { ...imported, ...subagent, historyOrigin: undefined })
+        .runtime,
+    ).toMatchObject({ status: "idle" });
+    expect(
+      deriveThreadRuntime({
+        ...importedDetail,
+        thread: { ...importedDetail.thread, ...subagent },
+      }),
+    ).toMatchObject({ status: "idle" });
   });
 
   it.each([

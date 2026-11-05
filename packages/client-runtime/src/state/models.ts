@@ -16,6 +16,7 @@ import type {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
+import { isProviderNativeSubagentThread } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
 import { formatSubagentDisplayTitle } from "./subagentDisplay.ts";
@@ -216,6 +217,16 @@ function terminalRunStatus(status: OrchestrationV2RunStatus): boolean {
   );
 }
 
+/**
+ * Provider-native subagents work without app runs. Any other thread that never ran
+ * has nothing live, even when it holds a provider thread, as an imported session does.
+ */
+export function hasRunlessProviderWork(
+  thread: Pick<OrchestrationV2ThreadShell, "activeProviderThreadId" | "lineage" | "creationSource">,
+): boolean {
+  return thread.activeProviderThreadId !== null && isProviderNativeSubagentThread(thread);
+}
+
 // Only work the agent waits on holds it: commands and monitors it left running
 // unmarked, such as a dev server, present the run's own status. The
 // server suppresses the roster while an interruptible activity run exists, so a
@@ -224,7 +235,7 @@ function shellRuntime(thread: OrchestrationV2ThreadShell): ThreadRuntimeSummary 
   const parkAtIdle =
     backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks ?? []) &&
     thread.status !== "failed";
-  if (thread.latestRunId === null && thread.activeProviderThreadId === null && !parkAtIdle) {
+  if (thread.latestRunId === null && !hasRunlessProviderWork(thread) && !parkAtIdle) {
     return null;
   }
   const status = parkAtIdle ? "idle" : (thread.activityRunStatus ?? thread.status);
