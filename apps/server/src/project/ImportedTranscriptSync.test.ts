@@ -192,7 +192,7 @@ function runEvents(input: {
   ];
 }
 
-const setup = Effect.fn(function* () {
+const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number }) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const sink = yield* EventSink.EventSinkV2;
@@ -316,7 +316,7 @@ const setup = Effect.fn(function* () {
   });
 
   const context = yield* Layer.build(
-    ImportedTranscriptSync.layer.pipe(
+    ImportedTranscriptSync.layerWith(options ?? {}).pipe(
       Layer.provide(
         Layer.mergeAll(
           Layer.succeed(EventSink.EventSinkV2, sink),
@@ -513,6 +513,109 @@ it.effect("treats a truncated or rewritten transcript as a safe no-op", () =>
       appendedCount: 0,
     });
     expect(yield* conversation).toEqual(before);
+
+    // A new file of the same size in its place is read from the start, not the old offset.
+    const replacement = `${filePath}.new`;
+    const anotherTurn = (answer: string) =>
+      imported +
+      line("user", "v3", "10:10:00", "another question") +
+      line("assistant", "b3", "10:10:05", answer);
+    const padding = (imported + discordTurn).length - anotherTurn("another answer").length;
+    yield* fileSystem.writeFileString(
+      replacement,
+      anotherTurn(`another answer ${"!".repeat(padding - 1)}`),
+    );
+    yield* fileSystem.rename(replacement, filePath);
+    expect((yield* fileSystem.stat(filePath)).size).toBe(BigInt((imported + discordTurn).length));
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 2 });
+    expect((yield* conversation).slice(before.length)).toEqual([
+      "5:another question",
+      expect.stringMatching(/^6:another answer/),
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("classifies a turn split across two syncs once, as the segment it continues", () =>
+  Effect.gen(function* () {
+    const { sync, sink, append, conversation } = yield* setup();
+    // T3's prompt is synced before the record Claude flushes after the run settled.
+    yield* sink.write({
+      events: runEvents({
+        ordinal: 1,
+        status: "completed",
+        startedAt: "10:04:59",
+        completedAt: "10:05:11",
+        nativeTurnId: "turn:attempt:1",
+        items: [{ role: "user", text: "t3 prompt" }],
+      }),
+    });
+    yield* append(line("user", "u2", "10:05:00", "t3 prompt"));
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 0 });
+    yield* append(line("assistant", "a2", "10:05:30", "t3 late answer"));
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 0 });
+
+    // Another client's prompt is synced before its reply.
+    yield* append(
+      line("user", "u3", "10:10:00", "discord question") +
+        line("assistant", "a3-tool", "10:10:01", [{ type: "tool_use", id: "tool", name: "Bash" }]),
+    );
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 1 });
+    yield* append(
+      line("user", "u3-result", "10:10:02", [{ type: "tool_result", tool_use_id: "tool" }]) +
+        line("assistant", "a3", "10:10:05", "discord answer"),
+    );
+    expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 1 });
+
+    expect(yield* conversation).toEqual([
+      "1:hi",
+      "2:hello",
+      "1000001:t3 prompt",
+      "1000002:discord question",
+      "1000003:discord answer",
+    ]);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect("catches up a transcript past the per-sync budget, then reads only appended bytes", () =>
+  Effect.gen(function* () {
+    const maxSyncBytes = 4 * 1024;
+    const { sync, append, conversation } = yield* setup({ maxSyncBytes });
+    // Non-conversation records from before the import, many budgets long.
+    const filler = Array.from(
+      { length: 64 },
+      (_, index) =>
+        `${JSON.stringify({ type: "progress", uuid: `p${index}`, data: "x".repeat(1024) })}\n`,
+    ).join("");
+    yield* append(filler + discordTurn);
+
+    let syncs = 0;
+    let result = yield* sync.syncThread(threadId);
+    let appended = 0;
+    while (result._tag === "Synced" && syncs < 100) {
+      syncs += 1;
+      appended += result.appendedCount;
+      if (result.caughtUp) break;
+      result = yield* sync.syncThread(threadId);
+    }
+    expect(result).toMatchObject({ _tag: "Synced", caughtUp: true });
+    expect(syncs).toBeGreaterThan(filler.length / maxSyncBytes);
+    expect(appended).toBe(2);
+
+    // A re-read from the start would stop at the budget, long before the new turn.
+    yield* append(laterDiscordTurn);
+    expect(yield* sync.syncThread(threadId)).toMatchObject({
+      _tag: "Synced",
+      appendedCount: 2,
+      caughtUp: true,
+    });
+    expect(yield* conversation).toEqual([
+      "1:hi",
+      "2:hello",
+      "3:discord question",
+      "4:discord answer",
+      "5:later question",
+      "6:later answer",
+    ]);
   }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
 

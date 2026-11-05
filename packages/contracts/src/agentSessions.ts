@@ -17,6 +17,10 @@ export const AgentSessionImportSource = Schema.Struct({
   // records stored a number.
   inode: Schema.NullOr(Schema.Union([Schema.String, Schema.Number])),
   birthtimeMs: Schema.NullOr(Schema.Number),
+  // Imported Claude threads: the end of the last transcript line synced, and whether the
+  // turn open there is one T3 ran. Absent until a sync has read this file.
+  syncedThroughOffset: Schema.optional(NonNegativeInt),
+  syncedSegmentOwnedByT3: Schema.optional(Schema.Boolean),
 });
 export type AgentSessionImportSource = typeof AgentSessionImportSource.Type;
 

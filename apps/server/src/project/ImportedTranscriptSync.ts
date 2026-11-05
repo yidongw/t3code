@@ -44,7 +44,11 @@ const TRANSCRIPT_POLL_INTERVAL = Duration.seconds(3);
 const MAX_WATCHED_THREADS = 32;
 // A transcript missing from its expected paths is searched for at most once a minute.
 const TRANSCRIPT_SEARCH_EVERY_POLLS = 20;
-const MAX_SYNC_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+// A long catch-up reads at most this much per sync and continues on the next poll.
+const MAX_SYNC_BYTES = 16 * 1024 * 1024;
+const READ_CHUNK_BYTES = 1024 * 1024;
+// Larger records are tool output, not conversation; they are skipped without being held.
+const MAX_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024;
 // Claude stamps a prompt after T3 marks the turn started and can flush records just after it settles.
 const T3_TURN_LEAD_MS = 2_000;
 const T3_TURN_GRACE_MS = 5_000;
@@ -173,32 +177,26 @@ interface TranscriptEntry {
   readonly isPrompt: boolean;
 }
 
-/** Keeps complete lines only; a record still being written is picked up on the next sync. */
-function parseClaudeTranscriptEntries(contents: string): ReadonlyArray<TranscriptEntry> {
-  const complete = contents.slice(0, contents.lastIndexOf("\n") + 1);
-  const entries: Array<TranscriptEntry> = [];
-  for (const line of complete.split("\n")) {
-    if (line.trim().length === 0) continue;
-    const record = Option.getOrUndefined(decodeClaudeLine(line));
-    if (record === undefined || record.isSidechain === true) continue;
-    if (record.type !== "user" && record.type !== "assistant") continue;
-    const atMs = record.timestamp === undefined ? NaN : Date.parse(record.timestamp);
-    const message =
-      record.timestamp === undefined
-        ? null
-        : AgentSessionScanner.claudeTranscriptMessage(record, record.timestamp);
-    entries.push({
-      uuid: record.uuid,
-      atMs: Number.isFinite(atMs) ? atMs : null,
-      message,
-      // Tool results carry no text and interrupt markers continue the interrupted turn.
-      isPrompt:
-        message?.role === "user" &&
-        record.isMeta !== true &&
-        !message.text.startsWith("[Request interrupted"),
-    });
-  }
-  return entries;
+function parseClaudeTranscriptLine(line: string): TranscriptEntry | null {
+  if (line.trim().length === 0) return null;
+  const record = Option.getOrUndefined(decodeClaudeLine(line));
+  if (record === undefined || record.isSidechain === true) return null;
+  if (record.type !== "user" && record.type !== "assistant") return null;
+  const atMs = record.timestamp === undefined ? NaN : Date.parse(record.timestamp);
+  const message =
+    record.timestamp === undefined
+      ? null
+      : AgentSessionScanner.claudeTranscriptMessage(record, record.timestamp);
+  return {
+    uuid: record.uuid,
+    atMs: Number.isFinite(atMs) ? atMs : null,
+    message,
+    // Tool results carry no text and interrupt markers continue the interrupted turn.
+    isPrompt:
+      message?.role === "user" &&
+      record.isMeta !== true &&
+      !message.text.startsWith("[Request interrupted"),
+  };
 }
 
 interface T3TurnEvidence {
@@ -207,40 +205,54 @@ interface T3TurnEvidence {
   readonly windows: ReadonlyArray<{ readonly startMs: number; readonly endMs: number }>;
 }
 
+type ExternalMessage = AgentSessionScanner.AgentSessionThreadMessage & { readonly uuid: string };
+
 /**
- * Conversation messages from segments T3 did not run. A segment starts at a user prompt; it is
- * T3's if it holds a uuid T3 recorded, or its prompt falls inside one of T3's provider turns.
+ * Collects conversation messages from segments T3 did not run. A segment starts at a user prompt;
+ * it is T3's if it holds a uuid T3 recorded, or its prompt falls inside one of T3's provider
+ * turns. A segment open at the end of one sync continues in the next with `openOwnedByT3`.
  */
-function externalTranscriptMessages(
-  entries: ReadonlyArray<TranscriptEntry>,
-  evidence: T3TurnEvidence,
-  importedThroughMs: number,
-): ReadonlyArray<AgentSessionScanner.AgentSessionThreadMessage & { readonly uuid: string }> {
-  const segments: Array<Array<TranscriptEntry>> = [[]];
-  for (const entry of entries) {
-    if (entry.isPrompt && segments.at(-1)!.length > 0) segments.push([]);
-    segments.at(-1)!.push(entry);
-  }
-  return segments.flatMap((segment) => {
-    const promptAtMs = segment[0]?.isPrompt === true ? segment[0].atMs : null;
-    const ownedByT3 =
-      segment.some((entry) => entry.uuid !== undefined && evidence.nativeIds.has(entry.uuid)) ||
-      (promptAtMs !== null &&
-        evidence.windows.some(
-          (window) =>
-            promptAtMs >= window.startMs - T3_TURN_LEAD_MS &&
-            promptAtMs <= window.endMs + T3_TURN_GRACE_MS,
-        ));
-    if (ownedByT3) return [];
-    return segment.flatMap((entry) =>
-      entry.message !== null &&
-      entry.uuid !== undefined &&
-      entry.atMs !== null &&
-      entry.atMs > importedThroughMs
-        ? [{ ...entry.message, uuid: entry.uuid }]
-        : [],
-    );
-  });
+function externalMessageCollector(input: {
+  readonly evidence: T3TurnEvidence;
+  readonly importedThroughMs: number;
+  readonly openOwnedByT3: boolean;
+}) {
+  const messages: Array<ExternalMessage> = [];
+  let segment: Array<ExternalMessage> = [];
+  let ownedByT3 = input.openOwnedByT3;
+  const close = () => {
+    if (!ownedByT3) messages.push(...segment);
+    segment = [];
+  };
+  return {
+    add: (entry: TranscriptEntry) => {
+      if (entry.isPrompt) {
+        close();
+        const promptAtMs = entry.atMs;
+        ownedByT3 =
+          promptAtMs !== null &&
+          input.evidence.windows.some(
+            (window) =>
+              promptAtMs >= window.startMs - T3_TURN_LEAD_MS &&
+              promptAtMs <= window.endMs + T3_TURN_GRACE_MS,
+          );
+      }
+      if (entry.uuid !== undefined && input.evidence.nativeIds.has(entry.uuid)) ownedByT3 = true;
+      if (
+        !ownedByT3 &&
+        entry.message !== null &&
+        entry.uuid !== undefined &&
+        entry.atMs !== null &&
+        entry.atMs > input.importedThroughMs
+      ) {
+        segment.push({ ...entry.message, uuid: entry.uuid });
+      }
+    },
+    finish: () => {
+      close();
+      return { messages, openOwnedByT3: ownedByT3 };
+    },
+  };
 }
 
 export type ImportedTranscriptSyncResult =
@@ -251,6 +263,8 @@ export type ImportedTranscriptSyncResult =
       readonly _tag: "Synced";
       readonly appendedCount: number;
       readonly source: AgentSessionImportSource;
+      /** False when the read stopped at the per-sync budget before the end of the file. */
+      readonly caughtUp: boolean;
     };
 
 export interface ImportedTranscriptSyncShape {
@@ -286,7 +300,88 @@ const isImportedClaudeThreadId = (threadId: ThreadId) => threadId.startsWith("im
 const toMs = (value: DateTime.Utc | null) =>
   value === null ? null : DateTime.toEpochMillis(value);
 
-const make = Effect.gen(function* () {
+const concatBytes = (parts: ReadonlyArray<Uint8Array>, byteLength: number) => {
+  if (parts.length === 1) return parts[0]!;
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const part of parts) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  return bytes;
+};
+
+/** The offset a sync can resume from: same file, not shrunk, and still a line boundary there. */
+const resumeOffset = Effect.fn("ImportedTranscriptSync.resumeOffset")(function* (
+  file: FileSystem.File,
+  opened: TranscriptIdentity,
+  progress: AgentSessionImportSource | undefined,
+) {
+  const offset = progress?.syncedThroughOffset;
+  if (
+    progress === undefined ||
+    offset === undefined ||
+    offset === 0 ||
+    offset > opened.size ||
+    !AgentSessionScanner.sameTranscriptIdentity(
+      { ...progress, size: opened.size, mtimeMs: opened.mtimeMs },
+      opened,
+    )
+  ) {
+    return 0;
+  }
+  yield* file.seek(BigInt(offset - 1), "start");
+  const before = yield* file.readAlloc(1);
+  return Option.isSome(before) && before.value[0] === 10 ? offset : 0;
+});
+
+/**
+ * Streams complete lines from `start` until `size`, stopping at the first line end past
+ * `maxBytes`. `endOffset` is the end of the last complete line read.
+ */
+const readTranscriptLines = Effect.fn("ImportedTranscriptSync.readTranscriptLines")(function* (
+  file: FileSystem.File,
+  input: { readonly start: number; readonly size: number; readonly maxBytes: number },
+  onLine: (line: string) => void,
+) {
+  yield* file.seek(BigInt(input.start), "start");
+  const decoder = new TextDecoder();
+  let position = input.start;
+  let endOffset = input.start;
+  let parts: Array<Uint8Array> = [];
+  let lineBytes = 0;
+  while (position < input.size) {
+    const chunk = yield* file.readAlloc(Math.min(READ_CHUNK_BYTES, input.size - position));
+    if (Option.isNone(chunk) || chunk.value.byteLength === 0) break;
+    const bytes = chunk.value;
+    let from = 0;
+    while (from < bytes.byteLength) {
+      const newline = bytes.indexOf(10, from);
+      const end = newline === -1 ? bytes.byteLength : newline;
+      lineBytes += end - from;
+      if (lineBytes > MAX_TRANSCRIPT_LINE_BYTES) parts = [];
+      else parts.push(bytes.subarray(from, end));
+      if (newline === -1) break;
+      if (lineBytes <= MAX_TRANSCRIPT_LINE_BYTES) {
+        onLine(decoder.decode(concatBytes(parts, lineBytes)));
+      }
+      parts = [];
+      lineBytes = 0;
+      endOffset = position + newline + 1;
+      from = newline + 1;
+      if (endOffset - input.start >= input.maxBytes) {
+        return { endOffset, caughtUp: endOffset >= input.size };
+      }
+    }
+    position += bytes.byteLength;
+  }
+  return { endOffset, caughtUp: true };
+});
+
+const make = Effect.fn("ImportedTranscriptSync.make")(function* (options?: {
+  readonly maxSyncBytes?: number;
+}) {
+  const maxSyncBytes = options?.maxSyncBytes ?? MAX_SYNC_BYTES;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const homeDir = yield* HostProcess.HomeDirectory;
@@ -483,7 +578,8 @@ const make = Effect.gen(function* () {
     const records = yield* loadThread(threadId);
     if (records === null) return { _tag: "NotSyncable" } as const;
     const nativeSessionId = records.providerThread.nativeThreadRef!.nativeId!;
-    const recorded = options?.source ?? (yield* recordedSource(threadId, nativeSessionId));
+    const stored = yield* recordedSource(threadId, nativeSessionId);
+    const recorded = options?.source ?? stored;
     if (recorded === undefined || recorded.provider !== "claudeAgent") {
       return { _tag: "NotSyncable" } as const;
     }
@@ -495,23 +591,12 @@ const make = Effect.gen(function* () {
             .identity
         : yield* identityAt(recorded.filePath);
     if (identity === null) return { _tag: "Unchanged", source: recorded } as const;
-    const source: AgentSessionImportSource = { ...recorded, ...identity };
     if (
       options?.source === undefined &&
-      AgentSessionScanner.sameTranscriptIdentity(recorded, source)
+      AgentSessionScanner.sameTranscriptIdentity(recorded, identity)
     ) {
       return { _tag: "Unchanged", source: recorded } as const;
     }
-    if (source.size > MAX_SYNC_TRANSCRIPT_BYTES) {
-      yield* Effect.logWarning("Imported transcript is too large to sync", {
-        threadId,
-        filePath: source.filePath,
-        size: source.size,
-      });
-      return { _tag: "Unchanged", source: recorded } as const;
-    }
-    const contents = yield* fileSystem.readFileString(source.filePath).pipe(Effect.option);
-    if (Option.isNone(contents)) return { _tag: "Unchanged", source: recorded } as const;
 
     // Runless items written by the import mark how far its history reached.
     const importedThroughMs = records.turnItems.reduce(
@@ -542,12 +627,43 @@ const make = Effect.gen(function* () {
         return startMs === null ? [] : [{ startMs, endMs: toMs(turn.completedAt) ?? startMs }];
       }),
     };
+    const scanned = yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* fileSystem.open(identity.filePath, { flag: "r" });
+        const opened = AgentSessionScanner.transcriptIdentity(identity.filePath, yield* file.stat);
+        // A re-import passes a freshly scanned source; the stored one still knows the offset.
+        const progress = recorded.syncedThroughOffset === undefined ? stored : recorded;
+        const start = yield* resumeOffset(file, opened, progress);
+        const collector = externalMessageCollector({
+          evidence,
+          importedThroughMs,
+          openOwnedByT3: start > 0 && progress?.syncedSegmentOwnedByT3 === true,
+        });
+        const read = yield* readTranscriptLines(
+          file,
+          { start, size: opened.size, maxBytes: maxSyncBytes },
+          (line) => {
+            const entry = parseClaudeTranscriptLine(line);
+            if (entry !== null) collector.add(entry);
+          },
+        );
+        return { opened, ...read, ...collector.finish() };
+      }),
+    ).pipe(Effect.option);
+    if (Option.isNone(scanned)) return { _tag: "Unchanged", source: recorded } as const;
+    const { opened, endOffset, caughtUp, messages, openOwnedByT3 } = scanned.value;
+    const source: AgentSessionImportSource = {
+      ...recorded,
+      ...opened,
+      // Short of the end, the recorded size is how far the sync got, so polls keep reading.
+      size: caughtUp ? opened.size : endOffset,
+      syncedThroughOffset: endOffset,
+      syncedSegmentOwnedByT3: openOwnedByT3,
+    };
     const existingItemIds = new Set<string>(records.turnItems.map((item) => item.id));
-    const pending = externalTranscriptMessages(
-      parseClaudeTranscriptEntries(contents.value),
-      evidence,
-      importedThroughMs,
-    ).filter((message) => !existingItemIds.has(syncTurnItemId(threadId, message.uuid)));
+    const pending = messages.filter(
+      (message) => !existingItemIds.has(syncTurnItemId(threadId, message.uuid)),
+    );
 
     let appendedCount = 0;
     if (pending.length > 0) {
@@ -589,7 +705,7 @@ const make = Effect.gen(function* () {
           .pipe(Effect.ignore);
       }
     }
-    return { _tag: "Synced", appendedCount, source } as const;
+    return { _tag: "Synced", appendedCount, source, caughtUp } as const;
   });
 
   const syncThread: ImportedTranscriptSyncShape["syncThread"] = (threadId, options) =>
@@ -664,7 +780,8 @@ const make = Effect.gen(function* () {
     yield* setEntry(threadId, (current) => ({
       ...current,
       recorded: result._tag === "NotSyncable" ? null : result.source,
-      lastSeen: null,
+      // A catch-up cut short by the budget continues on the next poll.
+      lastSeen: result._tag === "Synced" && !result.caughtUp ? identity : null,
     }));
   });
 
@@ -714,4 +831,7 @@ const make = Effect.gen(function* () {
   return ImportedTranscriptSync.of({ syncThread, watch, pollWatched });
 });
 
-export const layer = Layer.effect(ImportedTranscriptSync, make);
+export const layerWith = (options: { readonly maxSyncBytes?: number }) =>
+  Layer.effect(ImportedTranscriptSync, make(options));
+
+export const layer = Layer.effect(ImportedTranscriptSync, make());
