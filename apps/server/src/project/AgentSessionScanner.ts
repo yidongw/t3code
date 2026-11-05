@@ -419,6 +419,8 @@ function parseAgentSessionRecords(
   input: AgentSessionTranscriptMetadata,
   records: ReadonlyArray<DecodedTranscriptRecord>,
   claudeFields: ClaudeFields,
+  // Conversation messages the reader counted without passing them on.
+  unreadMessageCount = 0,
 ): AgentSessionThread | null {
   const fallbackTimestamp = DateTime.formatIso(DateTime.makeUnsafe(input.lastActiveAtMs));
   // Claude filenames are session IDs. Codex rollout filenames include extra
@@ -623,7 +625,7 @@ function parseAgentSessionRecords(
     createdAt: retainedMessages[0]?.createdAt ?? fallbackTimestamp,
     updatedAt: fallbackTimestamp,
     messages: retainedMessages,
-    omittedMessageCount: conversationMessageCount - retainedMessages.length,
+    omittedMessageCount: conversationMessageCount + unreadMessageCount - retainedMessages.length,
   };
 }
 
@@ -1061,6 +1063,14 @@ export const make = Effect.gen(function* () {
               return null;
             }
             const records: Array<DecodedTranscriptRecord> = [];
+            // A Claude import keeps the first prompt and the latest messages; the backfill adds
+            // the rest later, so the others are counted, not held.
+            const claudeWindow: Array<{
+              readonly record: DecodedTranscriptRecord;
+              readonly bytes: number;
+            }> = [];
+            let claudeFirstPrompt: (typeof claudeWindow)[number] | undefined;
+            let omittedMessageCount = 0;
             let cwd = Option.none<string>();
             let claudeFields = emptyClaudeFields;
             let historyBytes = 0;
@@ -1082,7 +1092,7 @@ export const make = Effect.gen(function* () {
             const finishRecord = () => {
               reader.write(decoder.decode());
               recordCount += 1;
-              if (recordCount > MAX_IMPORT_RECORDS) return false;
+              if (source !== "claudeAgent" && recordCount > MAX_IMPORT_RECORDS) return false;
               const value = reader.finish();
               const decoded = decodeTranscriptValue(value);
               if (Option.isNone(decoded) && source === "pi") {
@@ -1093,7 +1103,21 @@ export const make = Effect.gen(function* () {
                 if (source === "claudeAgent") {
                   claudeFields = foldClaudeFields(claudeFields, decoded.value);
                 }
-                if (shouldRetainDecodedRecord(source, decoded.value)) {
+                if (source === "claudeAgent" && shouldRetainDecodedRecord(source, decoded.value)) {
+                  const entry = { record: decoded.value, bytes: recordBytes };
+                  claudeWindow.push(entry);
+                  historyBytes += recordBytes;
+                  if (claudeFirstPrompt === undefined && decoded.value.type === "user") {
+                    claudeFirstPrompt = entry;
+                  }
+                  if (claudeWindow.length > MAX_IMPORTED_MESSAGES) {
+                    const dropped = claudeWindow.shift();
+                    if (dropped !== claudeFirstPrompt) {
+                      historyBytes -= dropped?.bytes ?? 0;
+                      omittedMessageCount += 1;
+                    }
+                  }
+                } else if (shouldRetainDecodedRecord(source, decoded.value)) {
                   if (
                     source === "pi" &&
                     decoded.value.type === "message" &&
@@ -1141,8 +1165,12 @@ export const make = Effect.gen(function* () {
             }
 
             if (recordStarted && !(yield* Effect.try(finishRecord))) return null;
+            if (claudeFirstPrompt !== undefined && !claudeWindow.includes(claudeFirstPrompt)) {
+              records.push(claudeFirstPrompt.record);
+            }
+            records.push(...claudeWindow.map((entry) => entry.record));
             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
-              ? { records, cwd, claudeFields }
+              ? { records, cwd, claudeFields, omittedMessageCount }
               : null;
           }),
         ),
@@ -1759,6 +1787,7 @@ export const make = Effect.gen(function* () {
             },
             snapshot.records,
             snapshot.claudeFields,
+            snapshot.omittedMessageCount,
           );
           if (parsedThread === null) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });

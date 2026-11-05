@@ -1708,6 +1708,45 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
         }),
     );
 
+    it.effect(
+      "imports a Claude transcript past the record limit as its first prompt and latest messages",
+      () =>
+        Effect.gen(function* () {
+          const path = yield* Path.Path;
+          const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+          yield* TestClock.setTime(nowMs);
+          const claudeHomePath = yield* makeTempDir("t3code-many-records-claude-");
+          const codexHomePath = yield* makeTempDir("t3code-many-records-codex-");
+          const workspace = yield* makeTempDir("t3code-many-records-workspace-");
+          const messages = Array.from({ length: 205 }, (_, index) =>
+            encodeTranscriptRecord({
+              type: index % 2 === 0 ? "user" : "assistant",
+              cwd: workspace,
+              sessionId: "many-records",
+              message: { content: `Message ${index}` },
+            }),
+          );
+          yield* writeTranscript({
+            filePath: path.join(claudeHomePath, "projects", "-slug", "many-records.jsonl"),
+            // Claude records the backfill adds later are counted, not held.
+            contents: [messages[0], "{}\n".repeat(100_000), ...messages.slice(1)].join("\n"),
+            mtimeMs: nowMs,
+          });
+
+          const [thread] = yield* runRecentThreads({
+            claudeHomePath,
+            codexHomePath,
+            workspaceRoot: workspace,
+          });
+
+          expect(thread?.omittedMessageCount).toBe(5);
+          expect(thread?.messages.map((message) => message.text)).toEqual([
+            "Message 0",
+            ...Array.from({ length: 199 }, (_, index) => `Message ${index + 6}`),
+          ]);
+        }),
+    );
+
     it.effect("imports long Claude tool history with metadata from discarded records", () =>
       Effect.gen(function* () {
         const path = yield* Path.Path;
