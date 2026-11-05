@@ -133,11 +133,29 @@ export function SidebarSectionHeader(props: {
         data-sidebar-row={`shelf:${shelf}`}
         onClick={props.toggle.onToggle}
         expanded={props.toggle.expanded}
-        tone={props.isDropTarget ? "accent" : props.dragging ? "emphasized" : "muted"}
+        tone={
+          props.isDropTarget
+            ? "accent"
+            : props.dragging
+              ? "emphasized"
+              : shelf === "working"
+                ? "strong"
+                : "muted"
+        }
         data-testid={`sidebar-${shelf}-shelf-toggle`}
         accessory={<span className="font-normal tabular-nums">{props.count}</span>}
       >
-        {props.label}
+        {shelf === "working" ? (
+          <span className="flex items-center gap-1.5">
+            <span
+              aria-hidden
+              className="size-1.5 rounded-full bg-success animate-pulse motion-reduce:animate-none"
+            />
+            {props.label}
+          </span>
+        ) : (
+          props.label
+        )}
       </CollapsibleSectionHeader>
     </SortableSidebarMarker>
   );

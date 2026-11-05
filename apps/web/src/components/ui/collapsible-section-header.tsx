@@ -4,6 +4,7 @@ import { cn } from "../../lib/utils";
 
 const tones = {
   muted: { label: "text-sidebar-muted-foreground", line: "bg-sidebar-border/50" },
+  strong: { label: "text-sidebar-foreground", line: "bg-sidebar-border/50" },
   emphasized: { label: "text-sidebar-foreground/80", line: "bg-sidebar-foreground/25" },
   accent: { label: "text-primary", line: "bg-primary/50" },
 } as const;
