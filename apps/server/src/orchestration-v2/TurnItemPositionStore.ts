@@ -16,6 +16,9 @@ export class TurnItemPositionStoreError extends Schema.TaggedError<TurnItemPosit
 
 const isTurnItemPositionStoreError = Schema.is(TurnItemPositionStoreError);
 
+/** Each run's items take one band of positions; runless items before every run take band 0. */
+export const RUN_BAND_SIZE = 1_000_000;
+
 export interface TurnItemPositionStoreV2Shape {
   readonly allocate: (input: {
     readonly threadId: ThreadId;
@@ -27,6 +30,19 @@ export interface TurnItemPositionStoreV2Shape {
     item: OrchestrationV2TurnItem,
     runOrdinal?: number,
   ) => Effect.Effect<OrchestrationV2TurnItem, TurnItemPositionStoreError>;
+  /** The highest position held in a run's band, or among runless items before every run. */
+  readonly maxInBand: (input: {
+    readonly threadId: ThreadId;
+    readonly runOrdinal: number;
+  }) => Effect.Effect<number | null, TurnItemPositionStoreError>;
+  /** Moves items to given positions, all or none; a position held by another item fails. */
+  readonly place: (input: {
+    readonly threadId: ThreadId;
+    readonly positions: ReadonlyArray<{
+      readonly turnItemId: TurnItemId;
+      readonly ordinal: number;
+    }>;
+  }) => Effect.Effect<void, TurnItemPositionStoreError>;
 }
 
 export class TurnItemPositionStoreV2 extends Context.Service<
@@ -61,8 +77,8 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
                 LIMIT 1
               `;
           const runOrdinal = suppliedRunOrdinal ?? runRows[0]?.ordinal ?? null;
-          const lowerBound = runOrdinal === null ? 0 : runOrdinal * 1_000_000;
-          const upperBound = runOrdinal === null ? 999_999 : lowerBound + 999_999;
+          const lowerBound = runOrdinal === null ? 0 : runOrdinal * RUN_BAND_SIZE;
+          const upperBound = lowerBound + RUN_BAND_SIZE - 1;
           yield* sql`
           INSERT INTO orchestration_v2_turn_item_positions (thread_id, turn_item_id, ordinal)
           SELECT
@@ -101,8 +117,60 @@ export const layer: Layer.Layer<TurnItemPositionStoreV2, never, SqlClient.SqlCli
           ),
       );
 
+    const maxInBand: TurnItemPositionStoreV2Shape["maxInBand"] = Effect.fn(
+      "TurnItemPositionStore.maxInBand",
+    )(function* ({ threadId, runOrdinal }) {
+      const lowerBound = runOrdinal * RUN_BAND_SIZE;
+      const rows = yield* sql<{ readonly ordinal: number | null }>`
+        SELECT MAX(ordinal) AS ordinal
+        FROM orchestration_v2_turn_item_positions
+        WHERE thread_id = ${threadId}
+          AND ordinal >= ${lowerBound}
+          AND ordinal < ${lowerBound + RUN_BAND_SIZE}
+      `.pipe(
+        Effect.mapError(
+          (cause) =>
+            new TurnItemPositionStoreError({
+              threadId,
+              turnItemId: TurnItemId.make(""),
+              cause,
+            }),
+        ),
+      );
+      return rows[0]?.ordinal ?? null;
+    });
+
+    const place: TurnItemPositionStoreV2Shape["place"] = Effect.fn("TurnItemPositionStore.place")(
+      function* ({ threadId, positions }) {
+        yield* sql
+          .withTransaction(
+            Effect.forEach(
+              positions,
+              ({ turnItemId, ordinal }) => sql`
+                INSERT INTO orchestration_v2_turn_item_positions (thread_id, turn_item_id, ordinal)
+                VALUES (${threadId}, ${turnItemId}, ${ordinal})
+                ON CONFLICT(thread_id, turn_item_id) DO UPDATE SET ordinal = excluded.ordinal
+              `,
+              { discard: true },
+            ),
+          )
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new TurnItemPositionStoreError({
+                  threadId,
+                  turnItemId: positions[0]?.turnItemId ?? TurnItemId.make(""),
+                  cause,
+                }),
+            ),
+          );
+      },
+    );
+
     return TurnItemPositionStoreV2.of({
       allocate,
+      maxInBand,
+      place,
       // Per-event normalization shares the enclosing orchestration span.
       normalize: Effect.fnUntraced(function* (item, runOrdinal) {
         return yield* allocate({
