@@ -754,6 +754,37 @@ export function sameTranscriptIdentity(
   );
 }
 
+function instanceEnvironmentValue(
+  instance: ProviderInstanceConfig,
+  hostEnvironment: NodeJS.ProcessEnv,
+  name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME",
+): string | undefined {
+  const configured = instance.environment?.findLast((variable) => variable.name === name)?.value;
+  return typeof configured === "string" ? configured : hostEnvironment[name];
+}
+
+/** The Claude config directory an instance keeps its transcripts under; null when its config is invalid. */
+export function claudeInstanceHome(input: {
+  readonly instance: ProviderInstanceConfig;
+  readonly hostEnvironment: NodeJS.ProcessEnv;
+  readonly homeDir: string;
+  readonly path: Path.Path;
+}): string | null {
+  const config = decodeClaudeSettings(input.instance.config ?? {});
+  if (Option.isNone(config)) return null;
+  const configured = config.value.homePath.trim();
+  if (configured.length > 0) {
+    return input.path.resolve(expandHomePath(configured, input.homeDir));
+  }
+  const fromEnvironment =
+    instanceEnvironmentValue(input.instance, input.hostEnvironment, "CLAUDE_CONFIG_DIR")?.trim() ??
+    "";
+  if (fromEnvironment.length > 0) {
+    return input.path.resolve(expandHomePath(fromEnvironment, input.homeDir));
+  }
+  return input.path.join(input.homeDir, ".claude");
+}
+
 /** @public */
 export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
@@ -1148,18 +1179,6 @@ export const make = Effect.gen(function* () {
     ).pipe(Effect.orElseSucceed((): ReadonlyMap<string, string> => new Map()));
   });
 
-  const resolveClaudeConfigDir = (homePath: string, environmentHome?: string): string => {
-    const configured = homePath.trim();
-    if (configured.length > 0) {
-      return path.resolve(expandHomePath(configured, homeDir));
-    }
-    const fromEnvironment = environmentHome?.trim() ?? "";
-    if (fromEnvironment.length > 0) {
-      return path.resolve(expandHomePath(fromEnvironment, homeDir));
-    }
-    return path.join(homeDir, ".claude");
-  };
-
   const discoverClaudeTranscripts = Effect.fn("AgentSessionScanner.discoverClaudeTranscripts")(
     function* (homePath: string, providerInstanceId: ProviderInstanceId, operationBudget: number) {
       const projectsDir = path.join(homePath, "projects");
@@ -1416,13 +1435,6 @@ export const make = Effect.gen(function* () {
       const homes: Array<{ homePath: string; providerInstanceId: ProviderInstanceId }> = [];
       const seenHomes = new Set<string>();
       for (const { instanceId, config: instance } of instances) {
-        const environmentHome = (name: "CLAUDE_CONFIG_DIR" | "CODEX_HOME") => {
-          const configured = instance.environment?.findLast(
-            (variable) => variable.name === name,
-          )?.value;
-          return typeof configured === "string" ? configured : hostEnvironment[name];
-        };
-
         let homePath: string;
         if (source === "pi") {
           const environment = yield* mergeProviderInstanceEnvironment(
@@ -1431,16 +1443,13 @@ export const make = Effect.gen(function* () {
           ).pipe(Effect.provideService(HostProcess.HomeDirectory, homeDir));
           homePath = resolvePiSessionsDir(environment, homeDir, path);
         } else if (source === "claudeAgent") {
-          const config = decodeClaudeSettings(instance.config ?? {});
-          if (Option.isNone(config)) continue;
-          homePath = resolveClaudeConfigDir(
-            config.value.homePath,
-            environmentHome("CLAUDE_CONFIG_DIR"),
-          );
+          const claudeHome = claudeInstanceHome({ instance, hostEnvironment, homeDir, path });
+          if (claudeHome === null) continue;
+          homePath = claudeHome;
         } else {
           const config = decodeCodexSettings(instance.config ?? {});
           if (Option.isNone(config)) continue;
-          const codexHome = environmentHome("CODEX_HOME");
+          const codexHome = instanceEnvironmentValue(instance, hostEnvironment, "CODEX_HOME");
           const codexSettings =
             config.value.homePath.trim().length === 0 &&
             config.value.shadowHomePath.trim().length === 0 &&
