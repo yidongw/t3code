@@ -102,10 +102,11 @@ Completed conversations are not imported again. You can continue without the
 remaining history.
 
 An imported Claude conversation stays in sync when you also continue it with
-`claude --resume` somewhere else, one client at a time. While the thread is open,
-T3 Code adds the user and assistant messages the other client wrote a few seconds
-after its turn ends; running import again does the same for every imported
-Claude thread. Messages from turns T3 Code ran itself are not added twice.
+`claude --resume` somewhere else, one client at a time. T3 Code adds the user and
+assistant messages the other client wrote a few seconds after its turn ends while
+the thread is open, and within about a minute otherwise, including for turns written
+while T3 Code was not running, so search finds them too. Archived threads are not
+updated. Messages from turns T3 Code ran itself are not added twice.
 
 You can continue without configuring agents or importing projects, or return to an earlier step
 using the setup progress bar. Navigation pauses while an import is running.
