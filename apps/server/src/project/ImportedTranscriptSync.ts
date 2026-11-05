@@ -9,6 +9,7 @@ import {
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2ProviderThread,
+  type OrchestrationV2ProviderTurn,
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
@@ -20,6 +21,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
@@ -59,8 +61,47 @@ const WORKING_RUN_STATUSES: ReadonlySet<string> = new Set([
   "waiting",
 ]);
 
+const BACKFILL_EVENT_PREFIX = "agent-session-backfill:v1";
+// A backfill step reads at most this much and adds at most about this many messages.
+const MAX_BACKFILL_STEP_BYTES = 8 * 1024 * 1024;
+const MAX_BACKFILL_STEP_MESSAGES = 200;
+const BACKFILL_STEP_PAUSE = Duration.millis(250);
+// Imported threads that a T3 run or a missing transcript held back are retried by later sweeps.
+const BACKFILL_SWEEP_DELAY = Duration.seconds(30);
+const BACKFILL_SWEEP_INTERVAL = Duration.minutes(10);
+const COMPLETE_HISTORY_NOTICE =
+  "Earlier history was imported from the original session transcript, which is unchanged.";
+
+/**
+ * Progress of copying an imported thread's full history from its transcript, kept in the
+ * thread's runtime payload. `plan` numbers the transcript's messages up to the end of the
+ * import, `relayout` moves the imported items to their numbers past `base`, and `fill` adds the
+ * missing messages at theirs. `offset` is the end of the last line a phase read.
+ */
+const ImportedHistoryBackfill = Schema.Struct({
+  phase: Schema.Literals(["plan", "relayout", "fill", "done", "skipped"]),
+  filePath: Schema.String,
+  device: Schema.Number,
+  inode: Schema.NullOr(Schema.Union([Schema.String, Schema.Number])),
+  birthtimeMs: Schema.NullOr(Schema.Number),
+  offset: Schema.Number,
+  segmentOwnedByT3: Schema.Boolean,
+  messageCount: Schema.Number,
+  matchedCount: Schema.Number,
+  /** The number of each imported message, in thread order. */
+  importedNumbers: Schema.Array(Schema.Number),
+  plannedCount: Schema.optional(Schema.Number),
+  base: Schema.optional(Schema.Number),
+  addedCount: Schema.Number,
+  reason: Schema.optional(Schema.String),
+});
+type ImportedHistoryBackfill = typeof ImportedHistoryBackfill.Type;
+
 const decodeImportedTranscripts = Schema.decodeUnknownOption(
   Schema.Struct({ importedTranscripts: Schema.optional(Schema.Array(AgentSessionImportSource)) }),
+);
+const decodeImportedHistoryBackfill = Schema.decodeUnknownOption(
+  Schema.Struct({ importedHistoryBackfill: ImportedHistoryBackfill }),
 );
 const decodeClaudeLine = Schema.decodeUnknownOption(
   Schema.fromJsonString(
@@ -205,6 +246,36 @@ interface T3TurnEvidence {
   readonly windows: ReadonlyArray<{ readonly startMs: number; readonly endMs: number }>;
 }
 
+function t3TurnEvidence(
+  threadId: ThreadId,
+  records: {
+    readonly providerThreads: ReadonlyArray<OrchestrationV2ProviderThread>;
+    readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
+  },
+): T3TurnEvidence {
+  const claudeProviderThreadIds = new Set(
+    records.providerThreads
+      .filter((thread) => thread.driver === "claudeAgent" && thread.appThreadId === threadId)
+      .map((thread) => thread.id),
+  );
+  const t3Turns = records.providerTurns.filter((turn) =>
+    claudeProviderThreadIds.has(turn.providerThreadId),
+  );
+  return {
+    nativeIds: new Set(
+      t3Turns.flatMap((turn) =>
+        turn.nativeTurnRef?.nativeId == null || turn.nativeTurnRef.nativeId.startsWith("turn:")
+          ? []
+          : [turn.nativeTurnRef.nativeId],
+      ),
+    ),
+    windows: t3Turns.flatMap((turn) => {
+      const startMs = toMs(turn.startedAt);
+      return startMs === null ? [] : [{ startMs, endMs: toMs(turn.completedAt) ?? startMs }];
+    }),
+  };
+}
+
 type ExternalMessage = AgentSessionScanner.AgentSessionThreadMessage & { readonly uuid: string };
 
 /**
@@ -216,12 +287,14 @@ function externalMessageCollector(input: {
   readonly evidence: T3TurnEvidence;
   readonly importedThroughMs: number;
   readonly openOwnedByT3: boolean;
+  readonly onMessage?: (message: ExternalMessage) => void;
 }) {
   const messages: Array<ExternalMessage> = [];
+  const emit = input.onMessage ?? ((message: ExternalMessage) => messages.push(message));
   let segment: Array<ExternalMessage> = [];
   let ownedByT3 = input.openOwnedByT3;
   const close = () => {
-    if (!ownedByT3) messages.push(...segment);
+    if (!ownedByT3) segment.forEach(emit);
     segment = [];
   };
   return {
@@ -280,6 +353,13 @@ export interface ImportedTranscriptSyncShape {
   readonly watch: (threadId: ThreadId) => Effect.Effect<void, never, Scope.Scope>;
   /** One poll of every watched thread; a background loop runs it every few seconds. */
   readonly pollWatched: Effect.Effect<void>;
+  /**
+   * One bounded step of copying the history an import left out from the transcript. A
+   * background worker runs steps for threads that are opened, imported or found by its sweep.
+   */
+  readonly backfillStep: (threadId: ThreadId) => Effect.Effect<ImportedHistoryBackfillStep>;
+  /** Queues the thread's backfill ahead of the startup sweep. */
+  readonly requestBackfill: (threadId: ThreadId) => Effect.Effect<void>;
 }
 
 export class ImportedTranscriptSync extends Context.Service<
@@ -287,8 +367,46 @@ export class ImportedTranscriptSync extends Context.Service<
   ImportedTranscriptSyncShape
 >()("t3/project/ImportedTranscriptSync") {}
 
+export type ImportedHistoryBackfillStep =
+  | { readonly _tag: "NotSyncable" }
+  | { readonly _tag: "Busy" }
+  | { readonly _tag: "TranscriptMissing" }
+  | {
+      readonly _tag: "Progress";
+      readonly phase: "plan" | "relayout" | "fill";
+      readonly addedCount: number;
+    }
+  | { readonly _tag: "Done"; readonly addedCount: number }
+  | { readonly _tag: "Skipped"; readonly reason: string };
+
 const syncTurnItemId = (threadId: ThreadId, uuid: string) =>
   TurnItemId.make(`${SYNC_EVENT_PREFIX}:turn-item:${threadId}:${uuid}`);
+const backfillTurnItemId = (threadId: ThreadId, uuid: string) =>
+  TurnItemId.make(`${BACKFILL_EVENT_PREFIX}:turn-item:${threadId}:${uuid}`);
+
+/** The notice an import writes when it keeps only part of the history. */
+export const historyNoticeItemId = (threadId: ThreadId) =>
+  TurnItemId.make(`${IMPORT_EVENT_PREFIX}:history-truncated:${threadId}`);
+
+type ConversationItem = Extract<
+  OrchestrationV2TurnItem,
+  { readonly type: "user_message" | "assistant_message" }
+>;
+
+const isConversationItem = (item: OrchestrationV2TurnItem): item is ConversationItem =>
+  item.type === "user_message" || item.type === "assistant_message";
+
+const itemStartedMs = (item: OrchestrationV2TurnItem) =>
+  DateTime.toEpochMillis(item.startedAt ?? item.updatedAt);
+
+/** The importer shaped its messages as the transcript does, so role, time and text match. */
+const sameConversationMessage = (
+  item: ConversationItem,
+  message: AgentSessionScanner.AgentSessionThreadMessage,
+) =>
+  (item.type === "user_message" ? "user" : "assistant") === message.role &&
+  item.text === message.text &&
+  itemStartedMs(item) === Date.parse(message.createdAt);
 
 /** Claude Code names a session's project directory after the cwd it runs in. */
 const claudeProjectDirName = (cwd: string) => cwd.replace(/[^a-zA-Z0-9]/g, "-");
@@ -311,13 +429,17 @@ const concatBytes = (parts: ReadonlyArray<Uint8Array>, byteLength: number) => {
   return bytes;
 };
 
-/** The offset a sync can resume from: same file, not shrunk, and still a line boundary there. */
+/** The offset a read can resume from: same file, not shrunk, and still a line boundary there. */
 const resumeOffset = Effect.fn("ImportedTranscriptSync.resumeOffset")(function* (
   file: FileSystem.File,
   opened: TranscriptIdentity,
-  progress: AgentSessionImportSource | undefined,
+  progress:
+    | (Pick<AgentSessionImportSource, "filePath" | "device" | "inode" | "birthtimeMs"> & {
+        readonly offset: number | undefined;
+      })
+    | undefined,
 ) {
-  const offset = progress?.syncedThroughOffset;
+  const offset = progress?.offset;
   if (
     progress === undefined ||
     offset === undefined ||
@@ -337,12 +459,13 @@ const resumeOffset = Effect.fn("ImportedTranscriptSync.resumeOffset")(function* 
 
 /**
  * Streams complete lines from `start` until `size`, stopping at the first line end past
- * `maxBytes`. `endOffset` is the end of the last complete line read.
+ * `maxBytes` or after a line `onLine` returns false for. `endOffset` is the end of the last
+ * complete line read.
  */
 const readTranscriptLines = Effect.fn("ImportedTranscriptSync.readTranscriptLines")(function* (
   file: FileSystem.File,
   input: { readonly start: number; readonly size: number; readonly maxBytes: number },
-  onLine: (line: string) => void,
+  onLine: (line: string) => boolean | void,
 ) {
   yield* file.seek(BigInt(input.start), "start");
   const decoder = new TextDecoder();
@@ -362,14 +485,14 @@ const readTranscriptLines = Effect.fn("ImportedTranscriptSync.readTranscriptLine
       if (lineBytes > MAX_TRANSCRIPT_LINE_BYTES) parts = [];
       else parts.push(bytes.subarray(from, end));
       if (newline === -1) break;
-      if (lineBytes <= MAX_TRANSCRIPT_LINE_BYTES) {
-        onLine(decoder.decode(concatBytes(parts, lineBytes)));
-      }
+      const more =
+        lineBytes > MAX_TRANSCRIPT_LINE_BYTES ||
+        onLine(decoder.decode(concatBytes(parts, lineBytes))) !== false;
       parts = [];
       lineBytes = 0;
       endOffset = position + newline + 1;
       from = newline + 1;
-      if (endOffset - input.start >= input.maxBytes) {
+      if (!more || endOffset - input.start >= input.maxBytes) {
         return { endOffset, caughtUp: endOffset >= input.size };
       }
     }
@@ -378,10 +501,18 @@ const readTranscriptLines = Effect.fn("ImportedTranscriptSync.readTranscriptLine
   return { endOffset, caughtUp: true };
 });
 
-const make = Effect.fn("ImportedTranscriptSync.make")(function* (options?: {
+interface ImportedTranscriptSyncOptions {
   readonly maxSyncBytes?: number;
-}) {
+  readonly maxBackfillStepBytes?: number;
+  readonly maxBackfillStepMessages?: number;
+}
+
+const make = Effect.fn("ImportedTranscriptSync.make")(function* (
+  options?: ImportedTranscriptSyncOptions,
+) {
   const maxSyncBytes = options?.maxSyncBytes ?? MAX_SYNC_BYTES;
+  const maxBackfillStepBytes = options?.maxBackfillStepBytes ?? MAX_BACKFILL_STEP_BYTES;
+  const maxBackfillStepMessages = options?.maxBackfillStepMessages ?? MAX_BACKFILL_STEP_MESSAGES;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const homeDir = yield* HostProcess.HomeDirectory;
@@ -606,34 +737,20 @@ const make = Effect.fn("ImportedTranscriptSync.make")(function* (options?: {
           : latest,
       Number.NEGATIVE_INFINITY,
     );
-    const claudeProviderThreadIds = new Set(
-      records.providerThreads
-        .filter((thread) => thread.driver === "claudeAgent" && thread.appThreadId === threadId)
-        .map((thread) => thread.id),
-    );
-    const t3Turns = records.providerTurns.filter((turn) =>
-      claudeProviderThreadIds.has(turn.providerThreadId),
-    );
-    const evidence: T3TurnEvidence = {
-      nativeIds: new Set(
-        t3Turns.flatMap((turn) =>
-          turn.nativeTurnRef?.nativeId == null || turn.nativeTurnRef.nativeId.startsWith("turn:")
-            ? []
-            : [turn.nativeTurnRef.nativeId],
-        ),
-      ),
-      windows: t3Turns.flatMap((turn) => {
-        const startMs = toMs(turn.startedAt);
-        return startMs === null ? [] : [{ startMs, endMs: toMs(turn.completedAt) ?? startMs }];
-      }),
-    };
+    const evidence = t3TurnEvidence(threadId, records);
     const scanned = yield* Effect.scoped(
       Effect.gen(function* () {
         const file = yield* fileSystem.open(identity.filePath, { flag: "r" });
         const opened = AgentSessionScanner.transcriptIdentity(identity.filePath, yield* file.stat);
         // A re-import passes a freshly scanned source; the stored one still knows the offset.
         const progress = recorded.syncedThroughOffset === undefined ? stored : recorded;
-        const start = yield* resumeOffset(file, opened, progress);
+        const start = yield* resumeOffset(
+          file,
+          opened,
+          progress === undefined
+            ? undefined
+            : { ...progress, offset: progress.syncedThroughOffset },
+        );
         const collector = externalMessageCollector({
           evidence,
           importedThroughMs,
@@ -719,6 +836,477 @@ const make = Effect.fn("ImportedTranscriptSync.make")(function* (options?: {
         ),
       );
 
+  const recordedBackfill = Effect.fn("ImportedTranscriptSync.recordedBackfill")(function* (
+    threadId: ThreadId,
+  ) {
+    const runtime = yield* runtimes.getByThreadId({ threadId }).pipe(Effect.option);
+    if (Option.isNone(runtime) || Option.isNone(runtime.value)) return undefined;
+    return Option.getOrUndefined(decodeImportedHistoryBackfill(runtime.value.value.runtimePayload))
+      ?.importedHistoryBackfill;
+  });
+
+  const saveBackfill = (threadId: ThreadId, state: ImportedHistoryBackfill) =>
+    runtimes.recordImportedHistoryBackfill({ threadId, state }).pipe(Effect.orDie);
+
+  /** Whether T3 is running the thread, read without its turn items. */
+  const runState = Effect.fn("ImportedTranscriptSync.runState")(function* (threadId: ThreadId) {
+    const records = yield* projections
+      .getThreadRecords(threadId, ["runs", "providerThreads"])
+      .pipe(Effect.option);
+    if (Option.isNone(records)) return null;
+    const { runs, providerThreads } = records.value;
+    return {
+      busy:
+        runs.some((run) => WORKING_RUN_STATUSES.has(run.status)) ||
+        providerThreads.some(
+          (thread) =>
+            thread.appThreadId === threadId && (thread.pendingBackgroundTasks?.length ?? 0) > 0,
+        ),
+      runCount: runs.length,
+    };
+  });
+
+  /** A T3 run that started since `runCount` runs existed owns what the step read. */
+  const runStartedSince = Effect.fn("ImportedTranscriptSync.runStartedSince")(function* (
+    threadId: ThreadId,
+    runCount: number,
+  ) {
+    const latest = yield* runState(threadId);
+    return latest === null || latest.busy || latest.runCount !== runCount;
+  });
+
+  const historyNoticeEvent = Effect.fn("ImportedTranscriptSync.historyNoticeEvent")(function* (
+    threadId: ThreadId,
+    notice: OrchestrationV2TurnItem | undefined,
+  ) {
+    if (notice?.type !== "system_notice" || notice.message === COMPLETE_HISTORY_NOTICE) {
+      return [];
+    }
+    const now = yield* DateTime.now;
+    return [
+      {
+        id: EventId.make(`${BACKFILL_EVENT_PREFIX}:history-notice:${threadId}`),
+        type: "turn-item.updated" as const,
+        threadId,
+        occurredAt: now,
+        payload: { ...notice, message: COMPLETE_HISTORY_NOTICE, updatedAt: now },
+      },
+    ];
+  });
+
+  /**
+   * One bounded step of copying the transcript's messages from before the end of the import into
+   * the thread. Positions are integers, so the imported items, which sit next to each other, move
+   * once to the numbers the transcript gives them, leaving a free position for every missing one.
+   */
+  const backfillUnlocked = Effect.fn("ImportedTranscriptSync.backfillStep")(function* (
+    threadId: ThreadId,
+  ) {
+    if (!isImportedClaudeThreadId(threadId)) return { _tag: "NotSyncable" } as const;
+    const saved = yield* recordedBackfill(threadId);
+    if (saved?.phase === "done") return { _tag: "Done", addedCount: saved.addedCount } as const;
+    if (saved?.phase === "skipped") {
+      return { _tag: "Skipped", reason: saved.reason ?? "unknown" } as const;
+    }
+    const running = yield* runState(threadId);
+    if (running === null) return { _tag: "NotSyncable" } as const;
+    if (running.busy) return { _tag: "Busy" } as const;
+    const records = yield* loadThread(threadId);
+    if (records === null) return { _tag: "NotSyncable" } as const;
+    const recorded = yield* recordedSource(
+      threadId,
+      records.providerThread.nativeThreadRef!.nativeId!,
+    );
+    if (recorded === undefined) return { _tag: "NotSyncable" } as const;
+    if (isBusy(records)) return { _tag: "Busy" } as const;
+
+    const importedItems = records.turnItems
+      .filter(
+        (item): item is ConversationItem =>
+          isConversationItem(item) && item.id.startsWith(`${IMPORT_EVENT_PREFIX}:turn-item:`),
+      )
+      .toSorted((left, right) => left.ordinal - right.ordinal);
+    const importedThroughMs = Math.max(...importedItems.map(itemStartedMs));
+    const notice = records.turnItems.find((item) => item.id === historyNoticeItemId(threadId));
+    const existingIds = new Set<string>(records.turnItems.map((item) => item.id));
+
+    const located = yield* locateTranscript({
+      threadId,
+      thread: records.thread,
+      recorded,
+      search: false,
+    });
+    if (located.identity === null) return { _tag: "TranscriptMissing" } as const;
+    const identity = located.identity;
+
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const file = yield* fileSystem.open(identity.filePath, { flag: "r" });
+        const opened = AgentSessionScanner.transcriptIdentity(identity.filePath, yield* file.stat);
+        const fileFields = {
+          filePath: opened.filePath,
+          device: opened.device,
+          inode: opened.inode,
+          birthtimeMs: opened.birthtimeMs,
+        };
+        const fresh: ImportedHistoryBackfill = {
+          phase: "plan",
+          ...fileFields,
+          offset: 0,
+          segmentOwnedByT3: false,
+          messageCount: 0,
+          matchedCount: 0,
+          importedNumbers: [],
+          addedCount: 0,
+        };
+        let state = saved ?? fresh;
+        const skip = Effect.fn("ImportedTranscriptSync.skipBackfill")(function* (reason: string) {
+          yield* Effect.logWarning("Imported Claude history was not backfilled", {
+            threadId,
+            reason,
+            filePath: opened.filePath,
+          });
+          yield* saveBackfill(threadId, { ...state, phase: "skipped", reason });
+          return { _tag: "Skipped", reason } as const;
+        });
+        const finish = Effect.fn("ImportedTranscriptSync.finishBackfill")(function* (
+          addedCount: number,
+        ) {
+          const events = yield* historyNoticeEvent(threadId, notice);
+          if (events.length > 0) yield* eventSink.write({ events }).pipe(Effect.orDie);
+          yield* saveBackfill(threadId, { ...state, phase: "done", addedCount });
+          return { _tag: "Done", addedCount } as const;
+        });
+
+        if (importedItems.length === 0) return yield* skip("no-imported-messages");
+        // Imports come before T3 runs, so all of this history belongs before the first run.
+        if (
+          records.runs.some(
+            (run) => DateTime.toEpochMillis(run.startedAt ?? run.requestedAt) <= importedThroughMs,
+          )
+        ) {
+          return yield* skip("run-before-import-end");
+        }
+
+        const start = yield* resumeOffset(file, opened, state);
+        if (start !== state.offset) {
+          // Another file, or this one rewritten: a phase reads its file from the start again.
+          state =
+            state.phase === "plan"
+              ? fresh
+              : {
+                  ...state,
+                  ...fileFields,
+                  offset: 0,
+                  segmentOwnedByT3: false,
+                  messageCount: 0,
+                  matchedCount: 0,
+                };
+        } else {
+          state = { ...state, ...fileFields };
+        }
+
+        if (state.phase === "plan") {
+          let messageCount = state.messageCount;
+          let matchedCount = state.matchedCount;
+          const importedNumbers = [...state.importedNumbers];
+          let reachedEnd = false;
+          const collector = externalMessageCollector({
+            evidence: t3TurnEvidence(threadId, records),
+            importedThroughMs: Number.NEGATIVE_INFINITY,
+            openOwnedByT3: state.segmentOwnedByT3,
+            onMessage: (message) => {
+              if (reachedEnd) return;
+              if (Date.parse(message.createdAt) > importedThroughMs) {
+                reachedEnd = true;
+                return;
+              }
+              const next = importedItems[matchedCount];
+              if (next !== undefined && sameConversationMessage(next, message)) {
+                importedNumbers.push(messageCount);
+                matchedCount += 1;
+              }
+              messageCount += 1;
+            },
+          });
+          const read = yield* readTranscriptLines(
+            file,
+            { start: state.offset, size: opened.size, maxBytes: maxBackfillStepBytes },
+            (line) => {
+              const entry = parseClaudeTranscriptLine(line);
+              if (entry !== null) collector.add(entry);
+              return !reachedEnd;
+            },
+          );
+          const { openOwnedByT3 } = collector.finish();
+          state = {
+            ...state,
+            offset: read.endOffset,
+            segmentOwnedByT3: openOwnedByT3,
+            messageCount,
+            matchedCount,
+            importedNumbers,
+          };
+          if (!reachedEnd && !read.caughtUp) {
+            yield* saveBackfill(threadId, state);
+            return { _tag: "Progress", phase: "plan", addedCount: 0 } as const;
+          }
+          if (matchedCount < importedItems.length) return yield* skip("transcript-mismatch");
+          if (messageCount === matchedCount) return yield* finish(0);
+          const synced = records.turnItems.filter(
+            (item) =>
+              item.runId === null &&
+              item.ordinal < TurnItemPositionStore.RUN_BAND_SIZE &&
+              item.id.startsWith(`${SYNC_EVENT_PREFIX}:turn-item:`),
+          );
+          const base =
+            ((yield* positions.maxInBand({ threadId, runOrdinal: 0 }).pipe(Effect.orDie)) ?? 0) + 1;
+          if (base + messageCount + synced.length >= TurnItemPositionStore.RUN_BAND_SIZE) {
+            return yield* skip("history-too-long");
+          }
+          state = {
+            ...state,
+            phase: "relayout",
+            base,
+            plannedCount: messageCount,
+            offset: 0,
+            segmentOwnedByT3: false,
+            messageCount: 0,
+            matchedCount: 0,
+          };
+          yield* saveBackfill(threadId, state);
+        }
+
+        const base = state.base!;
+        const plannedCount = state.plannedCount!;
+
+        if (state.phase === "relayout") {
+          // Synced items came after the import, in transcript order; they follow the planned ones.
+          const synced = records.turnItems
+            .filter(
+              (item) =>
+                item.runId === null &&
+                item.ordinal < TurnItemPositionStore.RUN_BAND_SIZE &&
+                item.id.startsWith(`${SYNC_EVENT_PREFIX}:turn-item:`),
+            )
+            .toSorted((left, right) => left.ordinal - right.ordinal);
+          const targets = [
+            ...importedItems.map((item, index) => ({
+              item,
+              ordinal: base + state.importedNumbers[index]!,
+            })),
+            ...synced.map((item, index) => ({ item, ordinal: base + plannedCount + index })),
+          ];
+          yield* positions
+            .place({
+              threadId,
+              positions: targets.map(({ item, ordinal }) => ({ turnItemId: item.id, ordinal })),
+            })
+            .pipe(Effect.orDie);
+          // Newest first: a client showing only recent history moves the rows it holds, and
+          // takes the rest for older history it has not loaded.
+          const moved = targets
+            .filter(({ item, ordinal }) => item.ordinal !== ordinal)
+            .toSorted((left, right) => right.ordinal - left.ordinal);
+          if (moved.length > 0) {
+            if (yield* runStartedSince(threadId, records.runs.length)) {
+              return { _tag: "Busy" } as const;
+            }
+            const now = yield* DateTime.now;
+            yield* eventSink
+              .write({
+                events: moved.map(({ item, ordinal }) => ({
+                  id: EventId.make(
+                    `${BACKFILL_EVENT_PREFIX}:position:${threadId}:${base}:${item.id}`,
+                  ),
+                  type: "turn-item.updated" as const,
+                  threadId,
+                  occurredAt: now,
+                  payload: { ...item, ordinal },
+                })),
+              })
+              .pipe(Effect.orDie);
+          }
+          state = { ...state, phase: "fill" };
+          yield* saveBackfill(threadId, state);
+          return { _tag: "Progress", phase: "relayout", addedCount: 0 } as const;
+        }
+
+        let messageCount = state.messageCount;
+        let matchedCount = state.matchedCount;
+        let reachedEnd = false;
+        let inconsistent = false;
+        const pending: Array<{ readonly message: ExternalMessage; readonly ordinal: number }> = [];
+        const collector = externalMessageCollector({
+          evidence: t3TurnEvidence(threadId, records),
+          importedThroughMs: Number.NEGATIVE_INFINITY,
+          openOwnedByT3: state.segmentOwnedByT3,
+          onMessage: (message) => {
+            if (reachedEnd || inconsistent) return;
+            if (Date.parse(message.createdAt) > importedThroughMs) {
+              reachedEnd = true;
+              return;
+            }
+            const next = importedItems[matchedCount];
+            if (next !== undefined && sameConversationMessage(next, message)) {
+              inconsistent ||= state.importedNumbers[matchedCount] !== messageCount;
+              matchedCount += 1;
+            } else if (messageCount >= plannedCount) {
+              inconsistent = true;
+            } else if (
+              !existingIds.has(backfillTurnItemId(threadId, message.uuid)) &&
+              !existingIds.has(syncTurnItemId(threadId, message.uuid))
+            ) {
+              pending.push({ message, ordinal: base + messageCount });
+            }
+            messageCount += 1;
+          },
+        });
+        const read = yield* readTranscriptLines(
+          file,
+          { start: state.offset, size: opened.size, maxBytes: maxBackfillStepBytes },
+          (line) => {
+            const entry = parseClaudeTranscriptLine(line);
+            if (entry !== null) collector.add(entry);
+            return !reachedEnd && !inconsistent && pending.length < maxBackfillStepMessages;
+          },
+        );
+        const { openOwnedByT3 } = collector.finish();
+        if (inconsistent) return yield* skip("transcript-changed");
+        if (pending.length > 0) {
+          yield* positions
+            .place({
+              threadId,
+              positions: pending.map(({ message, ordinal }) => ({
+                turnItemId: backfillTurnItemId(threadId, message.uuid),
+                ordinal,
+              })),
+            })
+            .pipe(Effect.orDie);
+          if (yield* runStartedSince(threadId, records.runs.length)) {
+            return { _tag: "Busy" } as const;
+          }
+          yield* eventSink
+            .write({
+              events: pending.flatMap(({ message, ordinal }) =>
+                importedMessageEvents({
+                  threadId,
+                  prefix: BACKFILL_EVENT_PREFIX,
+                  messageKey: `backfill:${message.uuid}`,
+                  itemKey: message.uuid,
+                  ordinal,
+                  message,
+                }),
+              ),
+            })
+            .pipe(Effect.orDie);
+        }
+        state = {
+          ...state,
+          offset: read.endOffset,
+          segmentOwnedByT3: openOwnedByT3,
+          messageCount,
+          matchedCount,
+          addedCount: state.addedCount + pending.length,
+        };
+        if (reachedEnd || read.caughtUp) {
+          if (matchedCount < importedItems.length) return yield* skip("transcript-changed");
+          return yield* finish(state.addedCount);
+        }
+        yield* saveBackfill(threadId, state);
+        return { _tag: "Progress", phase: "fill", addedCount: pending.length } as const;
+      }),
+    );
+  });
+
+  const backfillStep: ImportedTranscriptSyncShape["backfillStep"] = (threadId) =>
+    syncLock
+      .withPermits(1)(backfillUnlocked(threadId))
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Could not backfill an imported thread", { threadId, cause }).pipe(
+            Effect.as({ _tag: "Busy" } as const),
+          ),
+        ),
+      );
+
+  // Opened and newly imported threads go first; the startup sweep queues the rest behind them.
+  const backfillQueue = yield* Ref.make<{
+    readonly urgent: ReadonlyArray<ThreadId>;
+    readonly background: ReadonlyArray<ThreadId>;
+  }>({ urgent: [], background: [] });
+  const backfillWake = yield* Queue.unbounded<void>();
+  const backfillSettled = new Set<ThreadId>();
+
+  const queueBackfill = (threadId: ThreadId, priority: "first" | "urgent" | "background") =>
+    !isImportedClaudeThreadId(threadId) || backfillSettled.has(threadId)
+      ? Effect.void
+      : Ref.update(backfillQueue, ({ urgent, background }) => {
+          const queued = urgent.includes(threadId) || background.includes(threadId);
+          if (priority === "first") {
+            return {
+              urgent: [threadId, ...urgent.filter((id) => id !== threadId)],
+              background: background.filter((id) => id !== threadId),
+            };
+          }
+          if (queued) return { urgent, background };
+          return priority === "urgent"
+            ? { urgent: [...urgent, threadId], background }
+            : { urgent, background: [...background, threadId] };
+        }).pipe(Effect.andThen(Queue.offer(backfillWake, undefined)), Effect.asVoid);
+
+  const runBackfills = Effect.gen(function* () {
+    while (true) {
+      const { urgent, background } = yield* Ref.get(backfillQueue);
+      const threadId = urgent[0] ?? background[0];
+      if (threadId === undefined) {
+        yield* Queue.take(backfillWake);
+        continue;
+      }
+      const step = yield* backfillStep(threadId);
+      if (step._tag !== "Progress") {
+        // Busy and missing transcripts wait for a poll of the open thread or the next sweep.
+        yield* Ref.update(backfillQueue, (current) => ({
+          urgent: current.urgent.filter((id) => id !== threadId),
+          background: current.background.filter((id) => id !== threadId),
+        }));
+      }
+      if (step._tag === "Done" || step._tag === "Skipped" || step._tag === "NotSyncable") {
+        backfillSettled.add(threadId);
+      }
+      yield* Effect.sleep(BACKFILL_STEP_PAUSE);
+    }
+  });
+  yield* forkParked(runBackfills);
+
+  const sweepBackfills = runtimes.list().pipe(
+    Effect.flatMap((rows) =>
+      Effect.forEach(
+        rows,
+        (row) => {
+          const phase = Option.getOrUndefined(decodeImportedHistoryBackfill(row.runtimePayload))
+            ?.importedHistoryBackfill.phase;
+          const claude = Option.getOrUndefined(
+            decodeImportedTranscripts(row.runtimePayload),
+          )?.importedTranscripts?.some((source) => source.provider === "claudeAgent");
+          return claude === true && phase !== "done" && phase !== "skipped"
+            ? queueBackfill(row.threadId, "background")
+            : Effect.void;
+        },
+        { discard: true },
+      ),
+    ),
+    Effect.catchCause((cause) => Effect.logWarning("Imported history sweep failed", { cause })),
+  );
+  yield* forkParked(
+    Effect.sleep(BACKFILL_SWEEP_DELAY).pipe(
+      Effect.andThen(sweepBackfills.pipe(Effect.repeat(Schedule.spaced(BACKFILL_SWEEP_INTERVAL)))),
+    ),
+  );
+
+  const requestBackfill: ImportedTranscriptSyncShape["requestBackfill"] = (threadId) =>
+    queueBackfill(threadId, "urgent");
+
   interface WatchEntry {
     readonly refs: number;
     /** undefined until loaded; null when the thread cannot sync. */
@@ -740,6 +1328,8 @@ const make = Effect.fn("ImportedTranscriptSync.make")(function* (options?: {
     entry: WatchEntry,
   ) {
     if (entry.recorded === null) return;
+    // A backfill a T3 run held back resumes once the run is over.
+    yield* queueBackfill(threadId, "urgent");
     if (entry.recorded === undefined) {
       // The first poll syncs unconditionally so an opened thread catches up at once.
       const result = yield* syncThread(threadId);
@@ -825,13 +1415,19 @@ const make = Effect.fn("ImportedTranscriptSync.make")(function* (options?: {
                   return updated;
                 })
               : Effect.void,
-        ).pipe(Effect.asVoid)
+        ).pipe(Effect.andThen(queueBackfill(threadId, "first")))
       : Effect.void;
 
-  return ImportedTranscriptSync.of({ syncThread, watch, pollWatched });
+  return ImportedTranscriptSync.of({
+    syncThread,
+    watch,
+    pollWatched,
+    backfillStep,
+    requestBackfill,
+  });
 });
 
-export const layerWith = (options: { readonly maxSyncBytes?: number }) =>
+export const layerWith = (options: ImportedTranscriptSyncOptions) =>
   Layer.effect(ImportedTranscriptSync, make(options));
 
 export const layer = Layer.effect(ImportedTranscriptSync, make());

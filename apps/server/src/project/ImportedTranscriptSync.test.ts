@@ -24,13 +24,16 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Stream from "effect/Stream";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
 import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
+import * as ThreadSearch from "../orchestration-v2/ThreadSearch.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import { CLAUDE_MODEL_SELECTION } from "../orchestration-v2/testkit/fixtures/shared.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
@@ -55,6 +58,8 @@ const persistence = Layer.mergeAll(
   EventSink.layer.pipe(Layer.provide(stores)),
   ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
   TurnItemPositionStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+  ProjectStore.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
+  ThreadSearch.layer.pipe(Layer.provide(stores)),
   NodeServices.layer,
 );
 
@@ -192,7 +197,34 @@ function runEvents(input: {
   ];
 }
 
-const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number }) {
+interface ImportedHistory {
+  /** The transcript as the import found it. */
+  readonly transcript: string;
+  /** What the import kept of it. */
+  readonly messages: ReadonlyArray<{
+    readonly role: "user" | "assistant";
+    readonly text: string;
+    readonly time: string;
+  }>;
+  readonly omittedCount: number;
+}
+
+const defaultHistory: ImportedHistory = {
+  transcript: imported,
+  messages: [
+    { role: "user", text: "hi", time: "10:00:00" },
+    { role: "assistant", text: "hello", time: "10:00:01" },
+  ],
+  omittedCount: 0,
+};
+
+const setup = Effect.fn(function* (options?: {
+  readonly maxSyncBytes?: number;
+  readonly maxBackfillStepBytes?: number;
+  readonly maxBackfillStepMessages?: number;
+  readonly history?: ImportedHistory;
+}) {
+  const history = options?.history ?? defaultHistory;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const sink = yield* EventSink.EventSinkV2;
@@ -209,7 +241,7 @@ const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number })
       .makeDirectory(path.dirname(target), { recursive: true })
       .pipe(Effect.andThen(fileSystem.writeFileString(target, contents)));
   const filePath = transcriptFor(workspaceRoot);
-  yield* writeTranscript(filePath, imported);
+  yield* writeTranscript(filePath, history.transcript);
   const releases: Array<ProviderSessionId> = [];
 
   const created = utc("10:00:00");
@@ -267,21 +299,45 @@ const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number })
         occurredAt: created,
         payload: thread,
       },
-      ...ImportedTranscriptSync.importedMessageEvents({
-        threadId,
-        prefix: ImportedTranscriptSync.IMPORT_EVENT_PREFIX,
-        messageKey: "000000",
-        itemKey: "000000",
-        ordinal: 1,
-        message: { role: "user", text: "hi", createdAt: at("10:00:00") },
-      }),
-      ...ImportedTranscriptSync.importedMessageEvents({
-        threadId,
-        prefix: ImportedTranscriptSync.IMPORT_EVENT_PREFIX,
-        messageKey: "000001",
-        itemKey: "000001",
-        ordinal: 2,
-        message: { role: "assistant", text: "hello", createdAt: at("10:00:01") },
+      // As the importer writes them: the notice first, then what it kept.
+      ...(history.omittedCount === 0
+        ? []
+        : [
+            {
+              id: EventId.make("notice"),
+              type: "turn-item.updated" as const,
+              threadId,
+              occurredAt: created,
+              payload: {
+                id: ImportedTranscriptSync.historyNoticeItemId(threadId),
+                threadId,
+                runId: null,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 0,
+                status: "completed" as const,
+                title: null,
+                startedAt: created,
+                completedAt: created,
+                updatedAt: created,
+                type: "system_notice" as const,
+                message: `${history.omittedCount} earlier messages were not imported.`,
+              },
+            },
+          ]),
+      ...history.messages.flatMap((message, index) => {
+        const key = String(index).padStart(6, "0");
+        return ImportedTranscriptSync.importedMessageEvents({
+          threadId,
+          prefix: ImportedTranscriptSync.IMPORT_EVENT_PREFIX,
+          messageKey: key,
+          itemKey: key,
+          ordinal: index + 1,
+          message: { role: message.role, text: message.text, createdAt: at(message.time) },
+        });
       }),
       {
         id: EventId.make("provider-thread"),
@@ -315,7 +371,7 @@ const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number })
     },
   });
 
-  const context = yield* Layer.build(
+  const build = Layer.build(
     ImportedTranscriptSync.layerWith(options ?? {}).pipe(
       Layer.provide(
         Layer.mergeAll(
@@ -369,8 +425,10 @@ const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number })
         ),
       ),
     ),
+  ).pipe(
+    Effect.map((context) => Context.get(context, ImportedTranscriptSync.ImportedTranscriptSync)),
   );
-  const sync = Context.get(context, ImportedTranscriptSync.ImportedTranscriptSync);
+  const sync = yield* build;
   const append = (text: string) =>
     fileSystem
       .readFileString(filePath)
@@ -385,6 +443,21 @@ const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number })
         ? [`${item.ordinal}:${item.text}`]
         : [],
     );
+  });
+  const timeline = Effect.gen(function* () {
+    const { turnItems } = yield* (yield* ProjectionStore.ProjectionStoreV2).getThreadRecords(
+      threadId,
+      ["turnItems"],
+    );
+    return turnItems
+      .toSorted((left, right) => left.ordinal - right.ordinal)
+      .flatMap((item) =>
+        item.type === "user_message" || item.type === "assistant_message"
+          ? [`${item.ordinal}:${item.text}`]
+          : item.type === "system_notice"
+            ? [`${item.ordinal}:notice:${item.message}`]
+            : [],
+      );
   });
   const moveToWorktree = (worktreePath: string) =>
     sink.write({
@@ -403,6 +476,8 @@ const setup = Effect.fn(function* (options?: { readonly maxSyncBytes?: number })
     .pipe(Effect.map((result) => ("source" in result ? result.source.filePath : null)));
   return {
     sync,
+    build,
+    timeline,
     sink,
     append,
     conversation,
@@ -695,3 +770,254 @@ it.effect("warns once while no transcript exists and recovers when one appears",
     ),
   );
 });
+
+function hiddenLine(
+  flag: "isMeta" | "isCompactSummary" | "isSidechain",
+  uuid: string,
+  time: string,
+) {
+  return `${JSON.stringify({
+    type: flag === "isSidechain" ? "assistant" : "user",
+    uuid,
+    sessionId,
+    timestamp: at(time),
+    [flag]: true,
+    message: { content: [{ type: "text", text: `${flag} text` }] },
+  })}\n`;
+}
+
+// An import that kept the first prompt and the latest two messages of this history.
+const truncatedHistory: ImportedHistory = {
+  transcript:
+    line("assistant", "b0", "09:59:00", "resumed context") +
+    line("user", "b1", "10:00:00", "first prompt") +
+    line("assistant", "b2", "10:00:01", "dropped answer") +
+    hiddenLine("isMeta", "b3", "10:00:01") +
+    line("user", "b4", "10:00:02", "dropped prompt") +
+    hiddenLine("isSidechain", "b5", "10:00:02") +
+    line("assistant", "b6", "10:00:03", [{ type: "tool_use", id: "tool", name: "Bash" }]) +
+    hiddenLine("isCompactSummary", "b7", "10:00:03") +
+    line("assistant", "b8", "10:00:04", "dropped reply") +
+    line("user", "b9", "10:00:05", "window prompt") +
+    line("assistant", "b10", "10:00:06", "window answer"),
+  messages: [
+    { role: "user", text: "first prompt", time: "10:00:00" },
+    { role: "user", text: "window prompt", time: "10:00:05" },
+    { role: "assistant", text: "window answer", time: "10:00:06" },
+  ],
+  omittedCount: 4,
+};
+
+const backfillToEnd = (sync: ImportedTranscriptSync.ImportedTranscriptSyncShape) =>
+  Effect.gen(function* () {
+    const steps: Array<ImportedTranscriptSync.ImportedHistoryBackfillStep> = [];
+    let step = yield* sync.backfillStep(threadId);
+    while (step._tag === "Progress" && steps.length < 100) {
+      steps.push(step);
+      step = yield* sync.backfillStep(threadId);
+    }
+    return { steps, last: step };
+  });
+
+it.effect(
+  "backfills what an import left out in transcript order, around synced items and T3 runs",
+  () =>
+    Effect.gen(function* () {
+      const { sync, build, sink, append, timeline } = yield* setup({ history: truncatedHistory });
+      // Another client's turn, a T3 run, then another client's turn after it.
+      yield* append(discordTurn);
+      expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 2 });
+      yield* sink.write({
+        events: runEvents({
+          ordinal: 1,
+          status: "completed",
+          startedAt: "10:20:00",
+          completedAt: "10:20:11",
+          nativeTurnId: "t3-a",
+          items: [
+            { role: "user", text: "t3 prompt" },
+            { role: "assistant", text: "t3 answer" },
+          ],
+        }),
+      });
+      yield* append(
+        line("user", "t3-u", "10:20:01", "t3 prompt") +
+          line("assistant", "t3-a", "10:20:10", "t3 answer"),
+      );
+      yield* append(laterDiscordTurn);
+      expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 2 });
+      const after = [
+        "1000001:t3 prompt",
+        "1000002:t3 answer",
+        "1000003:later question",
+        "1000004:later answer",
+      ];
+      expect(yield* timeline).toEqual([
+        "1:notice:4 earlier messages were not imported.",
+        "2:first prompt",
+        "3:window prompt",
+        "4:window answer",
+        "5:discord question",
+        "6:discord answer",
+        ...after,
+      ]);
+
+      const { steps, last } = yield* backfillToEnd(sync);
+      expect(steps).toEqual([{ _tag: "Progress", phase: "relayout", addedCount: 0 }]);
+      expect(last).toEqual({ _tag: "Done", addedCount: 4 });
+      const backfilled = [
+        "7:resumed context",
+        "8:first prompt",
+        "9:dropped answer",
+        "10:dropped prompt",
+        "11:dropped reply",
+        "12:window prompt",
+        "13:window answer",
+        "14:discord question",
+        "15:discord answer",
+        ...after,
+      ];
+      const complete = yield* timeline;
+      expect(complete.slice(1)).toEqual(backfilled);
+      expect(complete[0]).toMatch(/^1:notice:Earlier history was imported/);
+
+      // Repeats, a restarted server and the next sync add nothing twice.
+      const events = yield* EventStore.EventStoreV2;
+      const eventCount = (yield* events.read({ threadId }).pipe(Stream.runCollect)).length;
+      expect(yield* sync.backfillStep(threadId)).toEqual({ _tag: "Done", addedCount: 4 });
+      expect(yield* (yield* build).backfillStep(threadId)).toEqual({
+        _tag: "Done",
+        addedCount: 4,
+      });
+      expect((yield* events.read({ threadId }).pipe(Stream.runCollect)).length).toBe(eventCount);
+      yield* append(line("user", "v7", "10:40:00", "after the backfill"));
+      expect(yield* sync.syncThread(threadId)).toMatchObject({ _tag: "Synced", appendedCount: 1 });
+      expect((yield* timeline).slice(1)).toEqual([...backfilled, "1000005:after the backfill"]);
+
+      // Backfilled messages are indexed like any other.
+      yield* (yield* ProjectStore.ProjectStoreV2).apply({
+        sequence: 0,
+        eventId: EventId.make("project:created"),
+        aggregateKind: "project",
+        aggregateId: ProjectId.make("project"),
+        occurredAt: at("10:00:00"),
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "project.created",
+        payload: {
+          projectId: ProjectId.make("project"),
+          title: "Repo",
+          workspaceRoot: "/repo",
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: at("10:00:00"),
+          updatedAt: at("10:00:00"),
+        },
+      });
+      const { matches } = yield* (yield* ThreadSearch.ThreadSearch).search({
+        query: "dropped reply",
+      });
+      expect(matches).toMatchObject([
+        { threadId, snippet: expect.stringContaining("dropped reply") },
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect(
+  "resumes a backfill after a restart, one bounded step at a time, never during a run",
+  () =>
+    Effect.gen(function* () {
+      const dropped = Array.from({ length: 12 }, (_, index) =>
+        line(
+          index % 2 === 0 ? "user" : "assistant",
+          `d${index}`,
+          `10:00:${String(10 + index).padStart(2, "0")}`,
+          `dropped ${index}`,
+        ),
+      ).join("");
+      const filler = `${JSON.stringify({ type: "progress", uuid: "p", data: "x".repeat(2048) })}\n`;
+      const history: ImportedHistory = {
+        transcript:
+          line("user", "f", "10:00:00", "first prompt") +
+          dropped +
+          filler +
+          line("user", "w1", "10:01:00", "window prompt") +
+          line("assistant", "w2", "10:01:01", "window answer"),
+        messages: [
+          { role: "user", text: "first prompt", time: "10:00:00" },
+          { role: "user", text: "window prompt", time: "10:01:00" },
+          { role: "assistant", text: "window answer", time: "10:01:01" },
+        ],
+        omittedCount: 12,
+      };
+      const budget = { maxBackfillStepBytes: 1024, maxBackfillStepMessages: 2 };
+      const { sync, build, sink, timeline } = yield* setup({ ...budget, history });
+      const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+      const saved = runtimes.getByThreadId({ threadId }).pipe(
+        Effect.map(
+          (runtime) =>
+            (
+              Option.getOrThrow(runtime).runtimePayload as {
+                readonly importedHistoryBackfill: {
+                  readonly phase: string;
+                  readonly offset: number;
+                };
+              }
+            ).importedHistoryBackfill,
+        ),
+      );
+
+      // Numbering the transcript takes several reads of at most about 1 KiB.
+      const planned: Array<ImportedTranscriptSync.ImportedHistoryBackfillStep> = [];
+      let step = yield* sync.backfillStep(threadId);
+      while (step._tag === "Progress" && step.phase === "plan") {
+        planned.push(step);
+        step = yield* sync.backfillStep(threadId);
+      }
+      expect(planned.length).toBeGreaterThan(1);
+      expect(step).toEqual({ _tag: "Progress", phase: "relayout", addedCount: 0 });
+
+      const firstFill = yield* sync.backfillStep(threadId);
+      expect(firstFill).toEqual({ _tag: "Progress", phase: "fill", addedCount: 3 });
+      const { offset } = yield* saved;
+
+      // A T3 run holds the backfill back until it is over.
+      const runningRun = {
+        ordinal: 1,
+        startedAt: "10:30:00",
+        nativeTurnId: "turn:attempt:1",
+      } as const;
+      yield* sink.write({
+        events: runEvents({ ...runningRun, status: "running", completedAt: null }),
+      });
+      expect(yield* sync.backfillStep(threadId)).toEqual({ _tag: "Busy" });
+      yield* sink.write({
+        events: runEvents({ ...runningRun, status: "completed", completedAt: "10:30:05" }),
+      });
+
+      // A restarted server continues from the saved offset. A step stops at its budget and adds
+      // the messages of the turn it stopped in.
+      const restarted = yield* build;
+      const resumed = yield* restarted.backfillStep(threadId);
+      expect(resumed).toMatchObject({ _tag: "Progress", phase: "fill" });
+      expect((yield* saved).offset).toBeGreaterThan(offset);
+      const rest = yield* backfillToEnd(restarted);
+      const fills = [firstFill, resumed, ...rest.steps];
+      for (const fill of fills) {
+        expect(fill).toMatchObject({ _tag: "Progress", phase: "fill" });
+        if (fill._tag !== "Progress") continue;
+        expect(fill.addedCount).toBeLessThanOrEqual(budget.maxBackfillStepMessages + 2);
+      }
+      expect(rest.last).toEqual({ _tag: "Done", addedCount: 12 });
+      expect((yield* saved).phase).toBe("done");
+
+      expect((yield* timeline).slice(1)).toEqual([
+        "5:first prompt",
+        ...Array.from({ length: 12 }, (_, index) => `${6 + index}:dropped ${index}`),
+        "18:window prompt",
+        "19:window answer",
+      ]);
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
