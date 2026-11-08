@@ -53,11 +53,15 @@ const READ_CHUNK_BYTES = 1024 * 1024;
 const MAX_TRANSCRIPT_LINE_BYTES = 32 * 1024 * 1024;
 // Imported threads nobody has open are checked by a sweep: one stat per thread while unchanged.
 const IMPORTED_SWEEP_STARTUP_DELAY = Duration.seconds(10);
-const IMPORTED_SWEEP_INTERVAL = Duration.seconds(30);
-// A swept thread's cwd, archive state and transcript path are re-resolved this often.
-const IMPORTED_SWEEP_RELOCATE_EVERY = 10;
+// As often as an open thread is polled, so an unopened thread is no more than a few seconds behind.
+const IMPORTED_SWEEP_INTERVAL = TRANSCRIPT_POLL_INTERVAL;
+/** How many sweeps, at `interval`, make up `period` (at least one). */
+export const sweepsPerPeriod = (period: Duration.Duration, interval: Duration.Duration): number =>
+  Math.max(1, Math.round(Duration.toMillis(period) / Duration.toMillis(interval)));
+// A swept thread's cwd, archive state and transcript path are re-resolved every 5 minutes.
+const IMPORTED_SWEEP_RELOCATE_EVERY = sweepsPerPeriod(Duration.minutes(5), IMPORTED_SWEEP_INTERVAL);
 // A missing transcript is searched for in every project directory about once a minute.
-const IMPORTED_SWEEP_SEARCH_EVERY = 2;
+const IMPORTED_SWEEP_SEARCH_EVERY = sweepsPerPeriod(Duration.minutes(1), IMPORTED_SWEEP_INTERVAL);
 // Claude stamps a prompt after T3 marks the turn started and can flush records just after it settles.
 const T3_TURN_LEAD_MS = 2_000;
 const T3_TURN_GRACE_MS = 5_000;

@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
+import * as Duration from "effect/Duration";
 import {
   EventId,
   MessageId,
@@ -1206,3 +1207,13 @@ it.effect(
       ]);
     }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
+
+describe("sweepsPerPeriod", () => {
+  it("turns a wall-clock period into a sweep count, so a faster sweep keeps the same timing", () => {
+    const { sweepsPerPeriod } = ImportedTranscriptSync;
+    expect(sweepsPerPeriod(Duration.minutes(1), Duration.seconds(3))).toBe(20);
+    expect(sweepsPerPeriod(Duration.minutes(5), Duration.seconds(3))).toBe(100);
+    expect(sweepsPerPeriod(Duration.minutes(1), Duration.seconds(30))).toBe(2);
+    expect(sweepsPerPeriod(Duration.seconds(1), Duration.seconds(3))).toBe(1);
+  });
+});
