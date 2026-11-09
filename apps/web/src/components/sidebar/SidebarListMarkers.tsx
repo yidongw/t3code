@@ -1,7 +1,7 @@
 import { CollapsibleSectionHeader } from "../ui/collapsible-section-header";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { type ReactNode, useLayoutEffect } from "react";
+import { type CSSProperties, type ReactNode, useLayoutEffect } from "react";
 import { cn } from "~/lib/utils";
 import {
   animateSidebarLayoutChanges,
@@ -10,11 +10,15 @@ import {
 } from "../Sidebar.logic";
 import { SIDEBAR_SORTABLE_DRAG_DISABLED } from "./SidebarThreadRow";
 
+// h-8: one shelf header row.
+const SHELF_HEADER_HEIGHT_PX = 32;
+
 function SortableSidebarMarker(props: {
   marker: SidebarListMarker;
   className?: string;
   children?: ReactNode;
   revealOverflow?: boolean;
+  style?: CSSProperties;
   "data-testid"?: string;
 }) {
   const { node, setNodeRef, transform, transition } = useSortable({
@@ -35,6 +39,7 @@ function SortableSidebarMarker(props: {
       data-testid={props["data-testid"]}
       className={cn("list-none", props.className)}
       style={{
+        ...props.style,
         transform: CSS.Translate.toString(transform),
         transition: props.marker.endsWith("-placeholder") ? "none" : transition,
         visibility: transform?.scaleY === 0 ? "hidden" : undefined,
@@ -115,6 +120,11 @@ export function SidebarSectionHeader(props: {
   className?: string;
   dragging?: boolean;
   isDropTarget?: boolean;
+  /**
+   * Where this header sits among the shelf headers shown, so they stack instead of covering each
+   * other: each sticks below the ones before it at the top and above the ones after it at the bottom.
+   */
+  stack: { index: number; count: number };
   toggle: { expanded: boolean; onToggle: () => void };
 }) {
   const shelf =
@@ -127,7 +137,12 @@ export function SidebarSectionHeader(props: {
     <SortableSidebarMarker
       marker={props.marker}
       data-testid={`sidebar-${props.marker}`}
-      className={cn("relative mx-0.5 h-8", props.className)}
+      // Shelf headers stay in view while the list scrolls, so their counts are always readable.
+      className={cn("sticky z-10 mx-0.5 h-8 bg-sidebar", props.className)}
+      style={{
+        top: props.stack.index * SHELF_HEADER_HEIGHT_PX,
+        bottom: (props.stack.count - 1 - props.stack.index) * SHELF_HEADER_HEIGHT_PX,
+      }}
     >
       <CollapsibleSectionHeader
         data-sidebar-row={`shelf:${shelf}`}
@@ -138,23 +153,28 @@ export function SidebarSectionHeader(props: {
             ? "accent"
             : props.dragging
               ? "emphasized"
-              : shelf === "working"
-                ? "strong"
-                : "muted"
+              : shelf === "snoozed"
+                ? "muted"
+                : "strong"
         }
         data-testid={`sidebar-${shelf}-shelf-toggle`}
         accessory={<span className="font-normal tabular-nums">{props.count}</span>}
       >
-        {shelf === "working" ? (
+        {shelf === "snoozed" ? (
+          props.label
+        ) : (
           <span className="flex items-center gap-1.5">
             <span
               aria-hidden
-              className="size-1.5 rounded-full bg-success animate-pulse motion-reduce:animate-none"
+              className={cn(
+                "size-1.5 rounded-full",
+                shelf === "working"
+                  ? "bg-success animate-pulse motion-reduce:animate-none"
+                  : "bg-sidebar-foreground/60",
+              )}
             />
             {props.label}
           </span>
-        ) : (
-          props.label
         )}
       </CollapsibleSectionHeader>
     </SortableSidebarMarker>

@@ -3437,6 +3437,18 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                           onDraftContextMenu={handleDraftContextMenu}
                         />,
                       ];
+                      const shelfHeaders = sidebarListItems.flatMap((item) =>
+                        item.kind === "marker" &&
+                        (item.marker === "working-header" ||
+                          item.marker === "snoozed-header" ||
+                          item.marker === "settled-header")
+                          ? [item.marker]
+                          : [],
+                      );
+                      const shelfStack = (marker: (typeof shelfHeaders)[number]) => ({
+                        index: shelfHeaders.indexOf(marker),
+                        count: shelfHeaders.length,
+                      });
                       for (const item of sidebarListItems) {
                         if (item.kind === "thread") {
                           // Folders draw active rows in their own place below.
@@ -3515,6 +3527,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               <SidebarSectionHeader
                                 key="working-shelf-header"
                                 marker="working-header"
+                                stack={shelfStack("working-header")}
                                 className="mt-auto"
                                 label="Working"
                                 count={workingThreads.length}
@@ -3530,6 +3543,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               <SidebarSectionHeader
                                 key="snoozed-shelf-header"
                                 marker="snoozed-header"
+                                stack={shelfStack("snoozed-header")}
                                 className={cn(workingThreads.length === 0 && "mt-auto")}
                                 label="Snoozed"
                                 count={snoozedThreads.length}
@@ -3545,6 +3559,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               <SidebarSectionHeader
                                 key="settled-shelf-header"
                                 marker="settled-header"
+                                stack={shelfStack("settled-header")}
                                 className={cn(
                                   workingThreads.length + snoozedThreads.length === 0 && "mt-auto",
                                 )}
