@@ -112,6 +112,23 @@ export function SidebarDragBoundary(props: {
   );
 }
 
+/**
+ * Opening a shelf scrolls its first row up under the stacked headers, so the shelf reads from its
+ * own header down. A shelf shorter than the viewport rises as far as the list can scroll.
+ */
+function scrollShelfToTop(header: HTMLElement, stackIndex: number) {
+  const firstRow = header.nextElementSibling;
+  const viewport = header.closest<HTMLElement>("[data-slot=scroll-area-viewport]");
+  if (!(firstRow instanceof HTMLElement) || viewport === null) return;
+  // An empty shelf is followed by the next sticky header, whose box is wherever it is pinned.
+  if (firstRow.querySelector('[data-sidebar-row^="shelf:"]') !== null) return;
+  const rowTop = firstRow.getBoundingClientRect().top - viewport.getBoundingClientRect().top;
+  viewport.scrollTo({
+    top: viewport.scrollTop + rowTop - (stackIndex + 1) * SHELF_HEADER_HEIGHT_PX,
+    behavior: "smooth",
+  });
+}
+
 export function SidebarSectionHeader(props: {
   marker: "working-header" | "snoozed-header" | "settled-header";
   label: string;
@@ -146,7 +163,17 @@ export function SidebarSectionHeader(props: {
     >
       <CollapsibleSectionHeader
         data-sidebar-row={`shelf:${shelf}`}
-        onClick={props.toggle.onToggle}
+        onClick={(event) => {
+          const expanding = !props.toggle.expanded;
+          const header = event.currentTarget.closest("li");
+          props.toggle.onToggle();
+          if (expanding && header !== null) {
+            // Wait for the shelf's rows to render before measuring where they start.
+            requestAnimationFrame(() =>
+              requestAnimationFrame(() => scrollShelfToTop(header, props.stack.index)),
+            );
+          }
+        }}
         expanded={props.toggle.expanded}
         tone={
           props.isDropTarget
