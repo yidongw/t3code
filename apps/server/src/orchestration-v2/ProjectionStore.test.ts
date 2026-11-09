@@ -3850,6 +3850,120 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 
+  it.effect("leaves the provider thread off the shell of a thread that never ran", () =>
+    Effect.gen(function* () {
+      const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+      const now = yield* DateTime.now;
+      const create = (
+        suffix: string,
+        creationSource: "server" | "provider",
+        relationshipToParent: "subagent" | null,
+      ) => {
+        const threadId = ThreadId.make(`thread:runless-${suffix}`);
+        const providerThreadId = ProviderThreadId.make(`provider-thread:runless-${suffix}`);
+        return projectionStore
+          .apply({
+            id: EventId.make(`event:runless-${suffix}:thread`),
+            type: "thread.created",
+            threadId,
+            occurredAt: now,
+            payload: {
+              createdBy: "system",
+              creationSource,
+              id: threadId,
+              projectId: ProjectId.make("project:runless"),
+              title: `Runless ${suffix}`,
+              providerInstanceId,
+              modelSelection,
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              activeProviderThreadId: null,
+              lineage: {
+                parentThreadId:
+                  relationshipToParent === null ? null : ThreadId.make("thread:runless-parent"),
+                relationshipToParent,
+                rootThreadId: threadId,
+              },
+              forkedFrom: null,
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              lastVisitedAt: null,
+              deletedAt: null,
+            },
+          })
+          .pipe(
+            Effect.andThen(
+              projectionStore.apply({
+                id: EventId.make(`event:runless-${suffix}:provider-thread`),
+                type: "provider-thread.updated",
+                threadId,
+                driver,
+                occurredAt: now,
+                payload: {
+                  id: providerThreadId,
+                  driver,
+                  providerInstanceId,
+                  providerSessionId: null,
+                  appThreadId: threadId,
+                  ownerNodeId: null,
+                  nativeThreadRef: null,
+                  nativeConversationHeadRef: null,
+                  status: "idle",
+                  firstRunOrdinal: null,
+                  lastRunOrdinal: null,
+                  handoffIds: [],
+                  forkedFrom: null,
+                  createdAt: now,
+                  updatedAt: now,
+                },
+              }),
+            ),
+            Effect.as({ threadId, providerThreadId }),
+          );
+      };
+      const imported = yield* create("imported", "server", null);
+      const subagent = yield* create("subagent", "provider", "subagent");
+
+      const shell = yield* projectionStore.getShellSnapshot();
+      const shellOf = (threadId: ThreadId) =>
+        shell.threads.find((thread) => thread.id === threadId);
+      // Clients that predate the subagent-only rule park any named provider thread in Working.
+      assert.isNull(shellOf(imported.threadId)?.activeProviderThreadId);
+      assert.strictEqual(
+        shellOf(subagent.threadId)?.activeProviderThreadId,
+        subagent.providerThreadId,
+      );
+      // Detail keeps it, so opening or continuing the thread still reaches the session.
+      assert.strictEqual(
+        (yield* projectionStore.getThreadProjection(imported.threadId)).thread
+          .activeProviderThreadId,
+        imported.providerThreadId,
+      );
+    }),
+  );
+
+  it("names the provider thread on the shell once the thread has run", () => {
+    const thread = {
+      activeProviderThreadId: ProviderThreadId.make("provider-thread:ran"),
+      creationSource: "server" as const,
+      lineage: {
+        parentThreadId: null,
+        relationshipToParent: null,
+        rootThreadId: ThreadId.make("thread:ran"),
+      },
+    };
+    assert.strictEqual(
+      ProjectionStore.shellActiveProviderThreadId(thread, RunId.make("run:ran")),
+      thread.activeProviderThreadId,
+    );
+    assert.isNull(ProjectionStore.shellActiveProviderThreadId(thread, null));
+  });
+
   // regression: #17141 shell snapshot decoding blocked other database reads
   it.effect("reads the shell snapshot first and decodes it in a separate step", () =>
     Effect.gen(function* () {

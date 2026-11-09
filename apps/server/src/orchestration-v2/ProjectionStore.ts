@@ -1,4 +1,4 @@
-import { pendingGuestMessageCount } from "@t3tools/contracts";
+import { isProviderNativeSubagentThread, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
@@ -1589,7 +1589,7 @@ export function threadShellFromProjection(
       : { activeOrderKey: projection.thread.activeOrderKey }),
     lineage: projection.thread.lineage,
     forkedFrom: projection.thread.forkedFrom,
-    activeProviderThreadId: projection.thread.activeProviderThreadId,
+    activeProviderThreadId: shellActiveProviderThreadId(projection.thread, latestRun?.id ?? null),
     ...(projection.thread.historyOrigin === undefined
       ? {}
       : { historyOrigin: projection.thread.historyOrigin }),
@@ -1658,6 +1658,24 @@ export function threadShellFromProjection(
     limitRecovery: projection.thread.limitRecovery ?? null,
     deletedAt: projection.thread.deletedAt,
   };
+}
+
+/**
+ * The provider thread a shell row names. Only provider-native subagents work without app runs, so
+ * a thread that never ran here, such as an imported session, names none: clients that predate
+ * that rule read any named provider thread as live work and park the row in Working as Waiting.
+ * Thread detail still names it, so opening or continuing the thread is unchanged.
+ */
+export function shellActiveProviderThreadId(
+  thread: Pick<
+    OrchestrationV2ThreadProjection["thread"],
+    "activeProviderThreadId" | "lineage" | "creationSource"
+  >,
+  latestRunId: RunId | null,
+): OrchestrationV2ThreadProjection["thread"]["activeProviderThreadId"] {
+  return latestRunId === null && !isProviderNativeSubagentThread(thread)
+    ? null
+    : thread.activeProviderThreadId;
 }
 
 function providerInstanceHistoryForShell(input: {
@@ -1870,7 +1888,10 @@ function shellFromState(input: {
       : { activeOrderKey: input.state.thread.activeOrderKey }),
     lineage: input.state.thread.lineage,
     forkedFrom: input.state.thread.forkedFrom,
-    activeProviderThreadId: input.state.thread.activeProviderThreadId,
+    activeProviderThreadId: shellActiveProviderThreadId(
+      input.state.thread,
+      input.state.latestRunId,
+    ),
     ...(input.state.thread.historyOrigin === undefined
       ? {}
       : { historyOrigin: input.state.thread.historyOrigin }),
