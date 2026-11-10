@@ -1,4 +1,5 @@
 import { useStableCallback } from "../../hooks/useStableCallback";
+import { scrollDebugLog } from "~/lib/scrollDebug";
 import { type MessageId, type RunId } from "@t3tools/contracts";
 import { CHAT_LIST_ANCHOR_OFFSET } from "@t3tools/shared/chatList";
 import { Debouncer } from "@tanstack/react-pacer";
@@ -323,6 +324,7 @@ export function useTimelineFollow(input: TimelineFollowInput) {
   };
   const onComposerPageScrollReleaseStable = useStableCallback(onComposerPageScrollRelease);
   const scrollToEnd = (animated: boolean = false) => {
+    scrollDebugLog(`follow scrollToEnd animated=${animated}`, true);
     // Stops a running position restore; follow itself is re-armed below.
     viewportRef.current?.navigate({ releasesFollow: false });
     followStore.dispatch(visit, { type: "followEnd" });
@@ -497,6 +499,9 @@ export function useTimelineFollow(input: TimelineFollowInput) {
     const { before, after } = followStore.dispatch(visit, {
       type: isAtEnd ? "reachedEnd" : "leftEnd",
     });
+    if (after !== before) {
+      scrollDebugLog(`follow ${before.mode} -> ${after.mode} (isAtEnd=${isAtEnd})`, true);
+    }
     if (after === before) return;
     if (after.mode === "following") {
       setTimelineAnchor(releaseChatTimelineAnchor);

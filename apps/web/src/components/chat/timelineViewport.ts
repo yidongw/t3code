@@ -1,3 +1,4 @@
+import { attachScrollDebug } from "../../lib/scrollDebug";
 import { isInSideChatPane } from "../../lib/sideChatPane";
 import { registerCommands } from "../../shortcuts/dispatcher";
 import {
@@ -134,6 +135,7 @@ export function attachTimelineViewport(scrollNode: HTMLElement): TimelineViewpor
       emit({ source: "scroll" });
     }
   };
+  const detachScrollDebug = attachScrollDebug(scrollNode);
   scrollNode.addEventListener("scroll", handleScroll, { passive: true });
   scrollNode.addEventListener("wheel", handleWheel, { passive: true });
   scrollNode.addEventListener("touchmove", handleTouchMove, { passive: true });
@@ -163,6 +165,7 @@ export function attachTimelineViewport(scrollNode: HTMLElement): TimelineViewpor
       return () => followReleasedListeners.delete(listener);
     },
     dispose: () => {
+      detachScrollDebug();
       listeners.clear();
       followReleasedListeners.clear();
       scrollNode.removeEventListener("scroll", handleScroll);
