@@ -270,6 +270,7 @@ import {
 } from "./sidebar/SidebarProjectFolderHeader";
 import {
   SidebarDragBoundary,
+  SidebarDockedShelfHeaders,
   SidebarSectionHeader,
   SidebarSectionPlaceholder,
 } from "./sidebar/SidebarListMarkers";
@@ -2983,6 +2984,54 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       ? shortcutLabelForCommand(keybindings, "chat.newLocal")
       : undefined);
   const newThreadInProjectShortcutLabel = shortcutLabelForCommand(keybindings, "chat.newLocal");
+  const shelfDragFrom = isContextDrag ? null : (dragState?.activeSection ?? null);
+  const shelfHeaderProps = {
+    "working-header": {
+      marker: "working-header",
+      label: "Working",
+      count: workingThreads.length,
+      toggle: { expanded: workingShelfExpanded, onToggle: toggleWorkingShelf },
+    },
+    "snoozed-header": {
+      marker: "snoozed-header",
+      label: "Snoozed",
+      count: snoozedThreads.length,
+      toggle: { expanded: snoozedShelfExpanded, onToggle: toggleSnoozedShelf },
+    },
+    "settled-header": {
+      marker: "settled-header",
+      label: "Settled",
+      count: settledCount,
+      dragging: shelfDragFrom !== null,
+      isDropTarget: dragTargetSection === "settled",
+      toggle: { expanded: settledShelfExpanded, onToggle: toggleSettledShelf },
+    },
+  } as const;
+  type ShelfMarker = keyof typeof shelfHeaderProps;
+  const shownShelfMarkers = sidebarListItems.flatMap((item): ShelfMarker[] =>
+    item.kind === "marker" && item.marker in shelfHeaderProps ? [item.marker as ShelfMarker] : [],
+  );
+  // A closed shelf docks its header under the list, outside the scroller. While a thread is
+  // dragged every header stays in the list, where the Settled header takes drops.
+  const isShelfDocked = (marker: ShelfMarker) =>
+    shelfDragFrom === null && !shelfHeaderProps[marker].toggle.expanded;
+  const inListShelfMarkers = shownShelfMarkers.filter((marker) => !isShelfDocked(marker));
+  const dockedShelfHeaders = isSearchingThreads
+    ? []
+    : shownShelfMarkers.filter(isShelfDocked).map((marker) => shelfHeaderProps[marker]);
+  const renderShelfHeader = (marker: ShelfMarker) => (
+    <SidebarSectionHeader
+      key={`${marker}-shelf`}
+      {...shelfHeaderProps[marker]}
+      docked={isShelfDocked(marker)}
+      stack={{
+        index: inListShelfMarkers.indexOf(marker),
+        count: inListShelfMarkers.length,
+      }}
+      // The first open shelf's header anchors the shelves to the bottom of a short list.
+      className={cn(inListShelfMarkers[0] === marker && "mt-auto")}
+    />
+  );
   return (
     <>
       <ThreadContextDragGhost />
@@ -2990,6 +3039,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       <SidebarContent
         ref={sidebarContentRef}
         className="min-h-full"
+        fixedFooter={<SidebarDockedShelfHeaders headers={dockedShelfHeaders} />}
         fixedHeader={
           <SidebarGroup className="z-[1]">
             <SidebarThreadHeader
@@ -3438,18 +3488,6 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                           onDraftContextMenu={handleDraftContextMenu}
                         />,
                       ];
-                      const shelfHeaders = sidebarListItems.flatMap((item) =>
-                        item.kind === "marker" &&
-                        (item.marker === "working-header" ||
-                          item.marker === "snoozed-header" ||
-                          item.marker === "settled-header")
-                          ? [item.marker]
-                          : [],
-                      );
-                      const shelfStack = (marker: (typeof shelfHeaders)[number]) => ({
-                        index: shelfHeaders.indexOf(marker),
-                        count: shelfHeaders.length,
-                      });
                       for (const item of sidebarListItems) {
                         if (item.kind === "thread") {
                           // Folders draw active rows in their own place below.
@@ -3524,56 +3562,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                             );
                             break;
                           case "working-header":
-                            items.push(
-                              <SidebarSectionHeader
-                                key="working-shelf-header"
-                                marker="working-header"
-                                stack={shelfStack("working-header")}
-                                className="mt-auto"
-                                label="Working"
-                                count={workingThreads.length}
-                                toggle={{
-                                  expanded: workingShelfExpanded,
-                                  onToggle: toggleWorkingShelf,
-                                }}
-                              />,
-                            );
+                            items.push(renderShelfHeader("working-header"));
                             break;
                           case "snoozed-header":
-                            items.push(
-                              <SidebarSectionHeader
-                                key="snoozed-shelf-header"
-                                marker="snoozed-header"
-                                stack={shelfStack("snoozed-header")}
-                                className={cn(!workingShelfEnabled && "mt-auto")}
-                                label="Snoozed"
-                                count={snoozedThreads.length}
-                                toggle={{
-                                  expanded: snoozedShelfExpanded,
-                                  onToggle: toggleSnoozedShelf,
-                                }}
-                              />,
-                            );
+                            items.push(renderShelfHeader("snoozed-header"));
                             break;
                           case "settled-header":
-                            items.push(
-                              <SidebarSectionHeader
-                                key="settled-shelf-header"
-                                marker="settled-header"
-                                stack={shelfStack("settled-header")}
-                                className={cn(
-                                  !workingShelfEnabled && snoozedThreads.length === 0 && "mt-auto",
-                                )}
-                                label="Settled"
-                                count={settledCount}
-                                dragging={from !== null}
-                                isDropTarget={dragTargetSection === "settled"}
-                                toggle={{
-                                  expanded: settledShelfExpanded,
-                                  onToggle: toggleSettledShelf,
-                                }}
-                              />,
-                            );
+                            items.push(renderShelfHeader("settled-header"));
                             break;
                           case "settled-placeholder":
                             items.push(
