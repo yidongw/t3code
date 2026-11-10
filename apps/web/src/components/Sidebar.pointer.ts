@@ -12,6 +12,13 @@ type Options = {
   onDrop?: (point: { x: number; y: number }) => boolean;
 };
 
+/**
+ * A touch must rest this long before a move becomes a drag. Sooner, the finger is scrolling: a
+ * pull past the list's top or bottom edge scrolls nothing natively, so the browser never cancels the
+ * pointer, and a quick-move drag would sort rows (and autoscroll the list) under every such swipe.
+ */
+export const SIDEBAR_TOUCH_DRAG_HOLD_MS = 350;
+
 export class SidebarPointerSensor {
   static activators = [
     {
@@ -76,6 +83,14 @@ export class SidebarPointerSensor {
           this.coordinates(),
           offset,
         );
+        return;
+      }
+      if (
+        this.pointer.pointerType === "touch" &&
+        event.timeStamp - this.pointer.timeStamp < SIDEBAR_TOUCH_DRAG_HOLD_MS
+      ) {
+        // A swipe, not a press-and-drag: let it scroll and treat the press as never dragged.
+        this.finish(false);
         return;
       }
       this.phase = "dragging";

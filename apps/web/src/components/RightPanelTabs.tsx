@@ -28,13 +28,15 @@ import {
   closestCenter,
   DndContext,
   type DragEndEvent,
-  PointerSensor,
+  MouseSensor,
+  TouchSensor,
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
 import { restrictToFirstScrollableAncestor, restrictToHorizontalAxis } from "@dnd-kit/modifiers";
 import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { SIDEBAR_TOUCH_DRAG_HOLD_MS } from "./Sidebar.pointer";
 import {
   Smartphone,
   ChevronDown,
@@ -828,7 +830,14 @@ function SortableTabList(props: {
   onMove: ((surfaceId: string, toIndex: number) => void) | undefined;
   children: ReactNode;
 }) {
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+  // A touch reorders only after a press-and-hold; a quick swipe scrolls the tab strip, even at its
+  // ends where the browser would not cancel the pointer.
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, {
+      activationConstraint: { delay: SIDEBAR_TOUCH_DRAG_HOLD_MS, tolerance: 6 },
+    }),
+  );
   const surfaceIds = props.surfaces.map((surface) => surface.id);
   const { onMove, surfaces } = props;
   const handleDragEnd = ({ active, over }: DragEndEvent) => {

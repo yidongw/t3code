@@ -1,7 +1,7 @@
 import type { SensorProps } from "@dnd-kit/core";
 import { describe, expect, it, vi } from "vite-plus/test";
 import { fakeTimers } from "../../test/render";
-import { SidebarPointerSensor } from "./Sidebar.pointer";
+import { SIDEBAR_TOUCH_DRAG_HOLD_MS, SidebarPointerSensor } from "./Sidebar.pointer";
 
 const sensors: SidebarPointerSensor[] = [];
 
@@ -19,6 +19,7 @@ function pointer(type: string, values: PointerEventInit = {}) {
 
 function gesture(
   extraOptions: Partial<ConstructorParameters<typeof SidebarPointerSensor>[0]["options"]> = {},
+  down: PointerEvent = pointer("pointerdown"),
 ) {
   const callbacks = {
     onStart: vi.fn(),
@@ -31,7 +32,7 @@ function gesture(
   const onFinish = vi.fn();
   const props = {
     active: "thread",
-    event: pointer("pointerdown"),
+    event: down,
     options: { distance: 6, onAttach: vi.fn(), onFinish, ...extraOptions },
     ...callbacks,
   } as unknown as SensorProps<ConstructorParameters<typeof SidebarPointerSensor>[0]["options"]>;
@@ -84,5 +85,40 @@ describe("sidebar pointer lifecycle", () => {
     expect(drag.onCancel).toHaveBeenCalledOnce();
     expect(drag.onEnd).not.toHaveBeenCalled();
     expect(drag.onFinish).toHaveBeenCalledExactlyOnceWith(true);
+  });
+  // A swipe that scrolls nothing natively (a pull past the list's top) is never cancelled by the
+  // browser; it must not start a sort drag that reorders rows and autoscrolls the list.
+  it("lets a quick touch swipe scroll instead of starting a drag", () => {
+    using _environment = setup();
+    const drag = gesture({}, pointer("pointerdown", { pointerType: "touch" }));
+    document.dispatchEvent(pointer("pointermove", { pointerType: "touch", clientY: 60 }));
+    document.dispatchEvent(pointer("pointermove", { pointerType: "touch", clientY: 120 }));
+
+    expect(drag.onStart).not.toHaveBeenCalled();
+    expect(drag.onMove).not.toHaveBeenCalled();
+    expect(drag.onAbort).toHaveBeenCalledOnce();
+    expect(drag.onFinish).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it("starts a touch drag after a press-and-hold", () => {
+    using _environment = setup();
+    const down = pointer("pointerdown", { pointerType: "touch" });
+    const drag = gesture({}, down);
+    const held = pointer("pointermove", { pointerType: "touch", clientY: 60 });
+    Object.defineProperty(held, "timeStamp", {
+      value: down.timeStamp + SIDEBAR_TOUCH_DRAG_HOLD_MS,
+    });
+    document.dispatchEvent(held);
+
+    expect(drag.onStart).toHaveBeenCalledOnce();
+    expect(drag.onAbort).not.toHaveBeenCalled();
+  });
+
+  it("starts a mouse drag on movement alone", () => {
+    using _environment = setup();
+    const drag = gesture();
+    document.dispatchEvent(pointer("pointermove", { clientY: 60 }));
+
+    expect(drag.onStart).toHaveBeenCalledOnce();
   });
 });
