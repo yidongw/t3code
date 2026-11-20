@@ -51,7 +51,7 @@ function previewReady(
   if (
     remark.kind !== "issue-comment" ||
     remark.author?.isBot !== true ||
-    remark.author.login.toLowerCase() !== "github-actions[bot]" ||
+    !["github-actions", "github-actions[bot]"].includes(remark.author.login.toLowerCase()) ||
     !publicHttpsUrl(remark.url) ||
     headSha === null ||
     !/^[a-f0-9]{40}$/i.test(headSha)

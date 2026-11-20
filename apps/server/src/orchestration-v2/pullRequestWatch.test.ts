@@ -90,6 +90,11 @@ describe("evaluatePullRequestWatch", () => {
     const current = detail({ headSha: sha, checks: [] });
     const first = evaluatePullRequestWatch(watch(), current, [ready]);
     assert.equal(first.changes[0]?.kind, "preview-ready");
+    const graphqlBot = { ...ready, author: { ...ready.author, login: "github-actions" } };
+    assert.equal(
+      evaluatePullRequestWatch(watch(), current, [graphqlBot]).changes[0]?.kind,
+      "preview-ready",
+    );
     assert.deepEqual(first.next.previewedHeadShas, [sha]);
     assert.deepEqual(evaluatePullRequestWatch(first.next, current, [ready]).changes, []);
     const message = pullRequestWatchMessage({
