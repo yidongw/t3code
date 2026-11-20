@@ -79,6 +79,82 @@ const remark = (
 const noRemarks: ReadonlyArray<PullRequestComment> = [];
 
 describe("evaluatePullRequestWatch", () => {
+  it("recognizes current preview metadata once per head, including comments predating a rewatch", () => {
+    const sha = "a".repeat(40);
+    const ready = {
+      ...remark("github-actions[bot]", STARTED),
+      kind: "issue-comment" as const,
+      author: { login: "github-actions[bot]", name: null, avatarUrl: null, isBot: true },
+      body: `<!-- preview-ready:${JSON.stringify({ version: 1, sha, links: [{ label: "App", url: "https://preview.example.com" }] })} -->`,
+    };
+    const current = detail({ headSha: sha, checks: [] });
+    const first = evaluatePullRequestWatch(watch(), current, [ready]);
+    assert.equal(first.changes[0]?.kind, "preview-ready");
+    assert.deepEqual(first.next.previewedHeadShas, [sha]);
+    assert.deepEqual(evaluatePullRequestWatch(first.next, current, [ready]).changes, []);
+    const message = pullRequestWatchMessage({
+      number: 1,
+      url: "https://github.com/o/r/pull/1",
+      baseBranch: "main",
+      headSha: sha,
+      report: first,
+    });
+    assert.equal(message.notification.preview?.links[0]?.url, "https://preview.example.com");
+    assert.equal(message.notification.preview?.headSha, sha);
+    const nextSha = "b".repeat(40);
+    const next = evaluatePullRequestWatch(first.next, detail({ headSha: nextSha, checks: [] }), [
+      { ...ready, body: ready.body.replaceAll(sha, nextSha) },
+    ]);
+    assert.deepEqual(next.next.previewedHeadShas, [sha, nextSha]);
+    assert.equal(next.changes[0]?.kind, "preview-ready");
+  });
+
+  it.each([
+    "stale",
+    "unknown-head",
+    "non-bot",
+    "other-bot",
+    "review",
+    "malformed",
+    "version",
+    "short-sha",
+    "http://preview.example.com",
+    "javascript:alert(1)",
+    "https://user:pass@preview.example.com",
+    "https://localhost",
+    "https://127.0.0.1",
+    "https://10.0.0.1",
+    "https://[::1]",
+    "https://app.local",
+    "https://app.internal",
+  ])("ignores untrusted preview metadata: %s", (mode) => {
+    const sha = "a".repeat(40);
+    const value = {
+      version: mode === "version" ? 2 : 1,
+      sha: mode === "short-sha" ? "aaaaaaa" : sha,
+      links: [{ label: "App", url: mode.includes(":") ? mode : "https://preview.example.com" }],
+    };
+    const ready: PullRequestComment = {
+      ...remark("github-actions[bot]", STARTED),
+      kind: mode === "review" ? "review-comment" : "issue-comment",
+      author: {
+        login: mode === "other-bot" ? "another[bot]" : "github-actions[bot]",
+        name: null,
+        avatarUrl: null,
+        isBot: mode !== "non-bot",
+      },
+      body: `<!-- preview-ready:${mode === "malformed" ? "{broken}" : JSON.stringify(value)} -->`,
+    };
+    const result = evaluatePullRequestWatch(
+      watch(),
+      detail({
+        headSha: mode === "unknown-head" ? undefined : mode === "stale" ? "b".repeat(40) : sha,
+        checks: [],
+      }),
+      [ready],
+    );
+    assert.isFalse(result.changes.some((change) => change.kind === "preview-ready"));
+  });
   it("reports each failure at once, even while another check never finishes", () => {
     const bot = check("CodeRabbit", "pending");
     const first = detail({ checks: [check("lint", "failure"), check("test", "pending"), bot] });

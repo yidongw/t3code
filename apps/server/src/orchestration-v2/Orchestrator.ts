@@ -2982,8 +2982,57 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           cause: "The pull request watch ended or its thread settled while it was read.",
         });
       }
+      const preview = command.wake?.notification.preview;
+      const showPreview =
+        preview !== undefined && !(link.watch.previewedHeadShas ?? []).includes(preview.headSha);
       yield* dispatchThreadMutation(command, events, effects);
+      if (showPreview) {
+        const projection = yield* projectionStore
+          .getThreadRecords(command.threadId, ["runs"])
+          .pipe(
+            Effect.mapError(
+              (cause) => new OrchestratorProjectionError({ threadId: command.threadId, cause }),
+            ),
+          );
+        const runs = projection.runs.toSorted((a, b) => b.ordinal - a.ordinal);
+        const run = runs.find(isActiveRun) ?? runs[0];
+        const now = yield* DateTime.now;
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "turn-item.updated",
+          threadId: command.threadId,
+          ...(run === undefined ? {} : { runId: run.id }),
+          providerInstanceId: run?.providerInstanceId ?? thread.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(
+              `pr-preview:${command.threadId}:${key.host}:${key.repository}:${key.number}:${preview.headSha}`,
+            ),
+            threadId: command.threadId,
+            runId: run?.id ?? null,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: yield* nextTurnItemOrdinal(projection),
+            status: "completed",
+            title: null,
+            startedAt: now,
+            completedAt: now,
+            updatedAt: now,
+            type: "notification",
+            source: { kind: "monitor" },
+            outcome: "updated",
+            summary: `Preview updated, click to open (#${key.number})`,
+            preview,
+          },
+        });
+      }
       if (command.wake === undefined) return;
+      const { preview: _preview, ...notification } = command.wake.notification;
       yield* dispatchMessage(
         {
           type: "message.dispatch",
@@ -2991,7 +3040,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: command.threadId,
           messageId: command.wake.messageId,
           text: command.wake.text,
-          notification: command.wake.notification,
+          notification,
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
           createdBy: "agent",
@@ -3886,7 +3935,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           const watch =
             command.type === "thread.pull-request-watch.sync"
               ? existing.watch?.startedAt === command.startedAt
-                ? (command.watch ?? undefined)
+                ? command.watch === null
+                  ? undefined
+                  : {
+                      ...command.watch,
+                      ...(existing.watch.previewedHeadShas !== undefined ||
+                      command.watch.previewedHeadShas !== undefined
+                        ? {
+                            previewedHeadShas: [
+                              ...new Set([
+                                ...(existing.watch.previewedHeadShas ?? []),
+                                ...(command.watch.previewedHeadShas ?? []),
+                              ]),
+                            ],
+                          }
+                        : {}),
+                    }
                 : existing.watch
               : !command.watching
                 ? undefined
@@ -3904,6 +3968,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                       passed: existing.endedWatch.passed,
                       passedChecks: existing.endedWatch.passedChecks,
                       conflicting: existing.endedWatch.conflicting,
+                      ...(existing.endedWatch.previewedHeadShas === undefined
+                        ? {}
+                        : { previewedHeadShas: existing.endedWatch.previewedHeadShas }),
                     }),
                     ...(existing.endedWatch?.owedChecks !== undefined && {
                       owedChecks: existing.endedWatch.owedChecks,
@@ -3917,8 +3984,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                   });
           if (watch === existing.watch && links === linked) return thread;
           const final =
-            command.type === "thread.pull-request-watch.sync" && watch === undefined
-              ? command.endedWatch
+            command.type === "thread.pull-request-watch.sync" &&
+            watch === undefined &&
+            command.endedWatch !== undefined
+              ? {
+                  ...command.endedWatch,
+                  ...(existing.watch?.previewedHeadShas !== undefined ||
+                  command.endedWatch.previewedHeadShas !== undefined
+                    ? {
+                        previewedHeadShas: [
+                          ...new Set([
+                            ...(existing.watch?.previewedHeadShas ?? []),
+                            ...(command.endedWatch.previewedHeadShas ?? []),
+                          ]),
+                        ],
+                      }
+                    : {}),
+                }
               : undefined;
           return {
             ...thread,

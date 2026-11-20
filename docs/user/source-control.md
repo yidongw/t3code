@@ -308,6 +308,13 @@ watch already reported; unlinking the pull request clears that. Subagents cannot
 it yourself, use the row menu in the **Linked pull requests** panel. In the thread details card, a
 watched pull request shows an eye; click it to stop watching.
 
+When a watched GitHub pull request receives a GitHub Actions bot comment with versioned
+`preview-ready` metadata for its current commit, the conversation also shows a persistent
+**Preview updated, click to open** card with the PR, commit, deployment details and clickable
+preview links. The card appears even while the agent is busy and is shown once per PR commit,
+including after restarting or watching again. A successful check alone does not create a preview
+card; the deployment must publish matching readiness metadata.
+
 A watched thread counts as working between wakes, so it stays in the **Working** section and does
 not auto-settle. Agents stop watching when they hand the work back to you, and the thread then
 returns to your inbox.
