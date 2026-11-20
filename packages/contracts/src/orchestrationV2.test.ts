@@ -549,7 +549,16 @@ describe("background work kinds from older or newer servers", () => {
       ],
     ] as const;
     for (const [source, preSpecificKindsSource] of cases) {
-      const item = decodeOrchestrationV2TurnItemJson(storedNotification(source));
+      const item = decodeOrchestrationV2TurnItemJson({
+        ...storedNotification(source),
+        preview: {
+          pullRequestUrl: "https://github.com/o/r/pull/1",
+          pullRequestNumber: 1,
+          headSha: "a".repeat(40),
+          commentUrl: "https://github.com/o/r/pull/1#issuecomment-1",
+          links: [{ label: "App", url: "https://preview.example.com" }],
+        },
+      });
       for (const encoded of [encodeOrchestrationV2TurnItemJson(item), sendOverWire(item)]) {
         expect(decodePreSpecificKinds(encoded).source).toEqual(preSpecificKindsSource);
         expect(decodeOrchestrationV2TurnItemJson(encoded)).toEqual(item);

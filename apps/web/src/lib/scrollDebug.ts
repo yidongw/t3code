@@ -19,7 +19,7 @@ function readEnabled(): boolean {
 }
 
 let enabled: boolean | null = null;
-export function scrollDebugEnabled(): boolean {
+function scrollDebugEnabled(): boolean {
   if (enabled === null) enabled = typeof window !== "undefined" && readEnabled();
   return enabled;
 }

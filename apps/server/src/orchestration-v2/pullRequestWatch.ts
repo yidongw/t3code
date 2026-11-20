@@ -19,7 +19,82 @@ export type PullRequestWatchChange =
   | { readonly kind: "checks-passed"; readonly count: number; readonly required: boolean }
   | { readonly kind: "remarks"; readonly remarks: ReadonlyArray<PullRequestComment> }
   | { readonly kind: "no-checks"; readonly minutes: number }
-  | { readonly kind: "conflicting" };
+  | { readonly kind: "conflicting" }
+  | { readonly kind: "preview-ready"; readonly preview: PreviewReady };
+
+type PreviewReady = Pick<
+  NonNullable<OrchestrationV2Notification["preview"]>,
+  "headSha" | "commentUrl" | "links"
+>;
+
+function publicHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return (
+      url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,}$/i.test(host) &&
+      !/(?:^|\.)(?:localhost|local|internal|lan|home|test|invalid)$/.test(host)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function previewReady(
+  remark: PullRequestComment,
+  headSha: string | null,
+): PreviewReady | undefined {
+  if (
+    remark.kind !== "issue-comment" ||
+    remark.author?.isBot !== true ||
+    !["github-actions", "github-actions[bot]"].includes(remark.author.login.toLowerCase()) ||
+    !publicHttpsUrl(remark.url) ||
+    headSha === null ||
+    !/^[a-f0-9]{40}$/i.test(headSha)
+  )
+    return;
+  const metadata = /<!--\s*preview-ready:(\{[^\n]*\})\s*-->/.exec(remark.body)?.[1];
+  if (metadata === undefined) return;
+  try {
+    const value: unknown = JSON.parse(metadata);
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !("version" in value) ||
+      value.version !== 1 ||
+      !("sha" in value) ||
+      typeof value.sha !== "string" ||
+      value.sha.toLowerCase() !== headSha.toLowerCase() ||
+      !("links" in value) ||
+      !Array.isArray(value.links) ||
+      value.links.length === 0 ||
+      value.links.length > 10
+    )
+      return;
+    const links: Array<{ label: string; url: string }> = [];
+    for (const link of value.links) {
+      if (
+        typeof link !== "object" ||
+        link === null ||
+        !("label" in link) ||
+        typeof link.label !== "string" ||
+        !link.label.trim() ||
+        link.label.length > 100 ||
+        !("url" in link) ||
+        !publicHttpsUrl(link.url)
+      )
+        return;
+      links.push({ label: link.label.trim(), url: link.url });
+    }
+    return { headSha: headSha.toLowerCase(), commentUrl: remark.url, links };
+  } catch {
+    return;
+  }
+}
 
 export interface PullRequestWatchReport {
   readonly changes: ReadonlyArray<PullRequestWatchChange>;
@@ -118,6 +193,17 @@ export function evaluatePullRequestWatch(
       remark.author?.login.toLowerCase() !== own
     );
   });
+  const previewedHeadShas = [...(watch.previewedHeadShas ?? [])];
+  const preview = (remarks ?? [])
+    .flatMap((remark) => {
+      const ready = previewReady(remark, detail.headSha ?? null);
+      return ready === undefined ? [] : [ready];
+    })
+    .at(-1);
+  if (preview !== undefined && !previewedHeadShas.includes(preview.headSha)) {
+    changes.push({ kind: "preview-ready", preview });
+    previewedHeadShas.push(preview.headSha);
+  }
   if (fresh.length > 0) changes.push({ kind: "remarks", remarks: fresh });
   const latest = Math.max(through, ...fresh.map((remark) => Date.parse(activeAt(remark))));
   const atLatest = fresh.filter((remark) => Date.parse(activeAt(remark)) === latest);
@@ -153,6 +239,7 @@ export function evaluatePullRequestWatch(
       conflicting,
       wakes,
       checksAwaitedSince,
+      ...(previewedHeadShas.length > 0 ? { previewedHeadShas } : {}),
     },
     exhausted: commentsOnly && wakes >= PULL_REQUEST_WATCH_WAKE_LIMIT,
   };
@@ -181,6 +268,12 @@ function changeLines(
   context: { readonly baseBranch: string; readonly commit: string },
 ): Array<string> {
   switch (change.kind) {
+    case "preview-ready":
+      return [
+        `- Preview updated on ${change.preview.headSha}:`,
+        ...change.preview.links.map((link) => `  - ${link.label}: ${link.url}`),
+        `  - ${change.preview.commentUrl}`,
+      ];
     case "checks-failed":
       return [
         `- Checks failed${context.commit}:`,
@@ -219,6 +312,7 @@ const SUMMARY: Record<PullRequestWatchChange["kind"], string> = {
   remarks: "new comments",
   "no-checks": "no checks reported",
   conflicting: "merge conflict",
+  "preview-ready": "preview updated",
 };
 
 export function pullRequestWatchMessage(input: {
@@ -229,6 +323,7 @@ export function pullRequestWatchMessage(input: {
   readonly report: PullRequestWatchReport;
 }): { readonly text: string; readonly notification: OrchestrationV2Notification } {
   const { changes, exhausted } = input.report;
+  const preview = changes.find((change) => change.kind === "preview-ready")?.preview;
   const context = {
     baseBranch: input.baseBranch,
     commit: input.headSha === null ? "" : ` on ${input.headSha.slice(0, 7)}`,
@@ -250,6 +345,9 @@ export function pullRequestWatchMessage(input: {
     text,
     notification: {
       source: { kind: "monitor" },
+      ...(preview === undefined
+        ? {}
+        : { preview: { ...preview, pullRequestUrl: input.url, pullRequestNumber: input.number } }),
       outcome: failed
         ? "failed"
         : changes.every((change) => change.kind === "checks-passed")

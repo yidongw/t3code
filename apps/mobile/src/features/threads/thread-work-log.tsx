@@ -35,6 +35,7 @@ import {
   Animated as NativeAnimated,
   type ColorValue,
   Easing,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -1005,6 +1006,45 @@ const ThreadWorkLogRow = function ThreadWorkLogRow(
           ) : null}
         </View>
       </WorkLogPressable>
+    );
+  }
+  if (
+    row.projectedItem.item.type === "notification" &&
+    row.projectedItem.item.preview !== undefined
+  ) {
+    const preview = row.projectedItem.item.preview;
+    const chinese = new Intl.DateTimeFormat()
+      .resolvedOptions()
+      .locale.toLowerCase()
+      .startsWith("zh");
+    return (
+      <View className="my-2 gap-2 rounded-lg border border-border p-3">
+        <Text className="font-t3-medium text-sm text-foreground">
+          {chinese ? "Preview 已更新，点击打开" : "Preview updated, click to open"}
+        </Text>
+        <Text selectable className="font-mono text-xs text-foreground-subtle">
+          {preview.headSha}
+        </Text>
+        {[
+          { label: `PR #${preview.pullRequestNumber}`, url: preview.pullRequestUrl },
+          ...preview.links,
+          { label: chinese ? "发布详情" : "Deployment details", url: preview.commentUrl },
+        ].map((link) => (
+          <Pressable
+            key={`${link.label}:${link.url}`}
+            accessibilityRole="link"
+            onPress={() => {
+              void Linking.openURL(link.url);
+            }}
+          >
+            <Text className="text-sm text-foreground underline">
+              {link.label}
+              {": "}
+              {link.url}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
     );
   }
   const notifiedSubagentThreadId =

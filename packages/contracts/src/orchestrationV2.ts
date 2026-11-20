@@ -1278,6 +1278,17 @@ export const OrchestrationV2Notification = Schema.Struct({
   outcome: Schema.Literals(["completed", "failed", "cancelled", "updated", "unknown"]),
   summary: TrimmedNonEmptyString,
   detail: Schema.optional(Schema.String),
+  preview: Schema.optional(
+    Schema.Struct({
+      pullRequestUrl: TrimmedNonEmptyString,
+      pullRequestNumber: PositiveInt,
+      headSha: TrimmedNonEmptyString,
+      commentUrl: TrimmedNonEmptyString,
+      links: Schema.Array(
+        Schema.Struct({ label: TrimmedNonEmptyString, url: TrimmedNonEmptyString }),
+      ),
+    }),
+  ),
 });
 export type OrchestrationV2Notification = typeof OrchestrationV2Notification.Type;
 

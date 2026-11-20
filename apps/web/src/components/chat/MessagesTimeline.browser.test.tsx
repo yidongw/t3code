@@ -217,6 +217,45 @@ const TASK_ID = ScheduledTaskId.make("task-1");
 const AUTOMATION_PROMPT = "Triage the inbox\n\nLabel every new issue and close duplicates.";
 
 describe("MessagesTimeline work rows", () => {
+  it.each([false, true])(
+    "shows preview URLs without expanding a work entry, working=%s",
+    async (isWorking) => {
+      setup();
+      const preview = {
+        pullRequestUrl: "https://github.com/o/r/pull/7",
+        pullRequestNumber: 7,
+        headSha: "a".repeat(40),
+        commentUrl: "https://github.com/o/r/pull/7#issuecomment-1",
+        links: [
+          { label: "App", url: "https://preview.example.com" },
+          { label: "Console", url: "https://console.example.com" },
+        ],
+      };
+      await using screen = await renderTimeline(
+        [
+          message("Update this PR"),
+          work("preview", {
+            label: "Preview updated",
+            itemType: "notification",
+            projectedItem: v2Item("notification", {
+              source: { kind: "monitor" },
+              outcome: "updated",
+              summary: "Preview updated",
+              preview,
+            }),
+          }),
+        ],
+        { isWorking },
+      );
+      await expect
+        .element(page.getByRole("link", { name: "App: https://preview.example.com" }))
+        .toHaveAttribute("href", "https://preview.example.com");
+      await expect
+        .element(page.getByRole("link", { name: "Console: https://console.example.com" }))
+        .toHaveAttribute("href", "https://console.example.com");
+      expect(screen.text()).toContain(preview.headSha.slice(0, 12));
+    },
+  );
   it("keeps the worked-for heading in place when expanded at the bottom", async () => {
     const props = baseProps();
     const runId = RunId.make("completed-run");

@@ -3043,6 +3043,134 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect.each(["empty", "idle", "active"])(
+    "persists preview visibility immediately while %s and dedupes replay and rewatch",
+    (mode) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const maintenance = yield* ProjectionReplay.ProjectionReplay;
+        const threadId = ThreadId.make(`preview-${mode}`);
+        yield* seedProject({
+          projectId: ProjectId.make("preview-project"),
+          title: "Preview",
+          workspaceRoot: "/workspace/preview",
+          defaultModelSelection: null,
+          createdAt: "2026-10-01T00:00:00.000Z",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`preview-create-${mode}`),
+          threadId,
+          projectId: ProjectId.make("preview-project"),
+          title: "Preview",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+        if (mode !== "empty") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`preview-run-${mode}`),
+            threadId,
+            messageId: MessageId.make(`preview-user-${mode}`),
+            text: "Work",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+        }
+        const originalRun = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0];
+        if (mode === "idle" && originalRun !== undefined) {
+          const sink = yield* EventSink.EventSinkV2;
+          const now = yield* DateTime.now;
+          yield* sink.write({
+            commandId: CommandId.make(`preview-complete-${mode}`),
+            events: [
+              {
+                id: EventId.make(`preview-completed-${mode}`),
+                type: "run.updated",
+                threadId,
+                runId: originalRun.id,
+                occurredAt: now,
+                payload: { ...originalRun, status: "completed", startedAt: now, completedAt: now },
+              },
+            ],
+          });
+        }
+        const key = { host: "github.com", repository: "owner/repo", number: 7 };
+        const url = "https://github.com/owner/repo/pull/7";
+        const start = (id: string, watching: boolean) =>
+          orchestrator.dispatch({
+            type: "thread.pull-request.watch",
+            commandId: CommandId.make(`preview-${id}-${mode}`),
+            threadId,
+            ...key,
+            watching,
+            link: { url, source: "agent" },
+          });
+        yield* start("start", true);
+        const started = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!;
+        const sha = "a".repeat(40);
+        const preview = {
+          pullRequestUrl: url,
+          pullRequestNumber: 7,
+          headSha: sha,
+          commentUrl: `${url}#issuecomment-1`,
+          links: [{ label: "App", url: "https://preview.example.com" }],
+        };
+        const sync = (id: string, watch: typeof started) =>
+          orchestrator.dispatch({
+            type: "thread.pull-request-watch.sync",
+            commandId: CommandId.make(`preview-sync-${id}-${mode}`),
+            threadId,
+            ...key,
+            startedAt: watch.startedAt,
+            watch: { ...watch, headSha: sha, previewedHeadShas: [sha] },
+            wake: {
+              messageId: MessageId.make(`preview-wake-${id}-${mode}`),
+              text: "Preview updated",
+              notification: {
+                source: { kind: "monitor" },
+                outcome: "updated",
+                summary: "Preview updated",
+                preview,
+              },
+            },
+          });
+        yield* sync("first", started);
+        const first = yield* orchestrator.getThreadRecords(threadId, ["turnItems", "runs"]);
+        const visible = first.turnItems.filter(
+          (item) => item.type === "notification" && item.preview !== undefined,
+        );
+        assert.lengthOf(visible, 1);
+        assert.equal(visible[0]!.runId, originalRun?.id ?? null);
+        assert.isTrue((yield* maintenance.rebuild).valid);
+        yield* sync("raced", started);
+        yield* start("stop", false);
+        assert.deepEqual(
+          (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.endedWatch
+            ?.previewedHeadShas,
+          [sha],
+        );
+        yield* start("restart", true);
+        const restarted = (yield* orchestrator.getThreadShell(threadId))!.pullRequests![0]!.watch!;
+        assert.deepEqual(restarted.previewedHeadShas, [sha]);
+        yield* sync("rewatched", restarted);
+        const after = yield* orchestrator.getThreadRecords(threadId, ["turnItems"]);
+        assert.lengthOf(
+          after.turnItems.filter(
+            (item) => item.type === "notification" && item.preview !== undefined,
+          ),
+          1,
+        );
+      }),
+  );
+
   it.effect.each(["manual", "automatic"])("settling ends every pull request watch: %s", (mode) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

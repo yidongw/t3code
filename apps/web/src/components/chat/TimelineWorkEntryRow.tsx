@@ -152,6 +152,64 @@ type WorkEntryRowProps = {
 export const SimpleWorkEntryRow = memo(function SimpleWorkEntryRow(props: WorkEntryRowProps) {
   const ctx = use(TimelineRowCtx);
   const item = props.workEntry.projectedItem?.item;
+  if (item?.type === "notification" && item.preview !== undefined) {
+    const preview = item.preview;
+    const chinese = navigator.language.toLowerCase().startsWith("zh");
+    return (
+      <section
+        data-v2-item-type="notification"
+        className="my-2 rounded-lg border border-border bg-muted/30 p-3 text-sm"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <p className="font-medium">
+            {chinese ? "Preview 已更新，点击打开" : "Preview updated, click to open"}
+          </p>
+          <TimelineRowTimestamp
+            createdAt={props.workEntry.createdAt}
+            timestampFormat={ctx.timestampFormat}
+            alwaysVisible
+          />
+        </div>
+        <p className="mt-1 break-all text-xs text-muted-foreground">
+          <a
+            href={preview.pullRequestUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline"
+          >
+            PR #{preview.pullRequestNumber}
+          </a>
+          {" · "}
+          <span>{preview.headSha}</span>
+          {" · "}
+          <a
+            href={preview.commentUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline"
+          >
+            {chinese ? "发布详情" : "Deployment details"}
+          </a>
+        </p>
+        <ul className="mt-2 space-y-1">
+          {preview.links.map((link) => (
+            <li key={`${link.label}:${link.url}`}>
+              <a
+                href={link.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="break-all text-primary underline underline-offset-2"
+              >
+                {link.label}
+                {": "}
+                {link.url}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </section>
+    );
+  }
   const childThreadId =
     item?.type === "notification" ? notificationChildThreadId(item.source) : undefined;
   if (item?.type !== "notification" || childThreadId === undefined) {
